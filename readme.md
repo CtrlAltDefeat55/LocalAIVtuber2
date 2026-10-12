@@ -17,7 +17,7 @@ A fully local AI VTuber that talks in real time, can see your screen, and runs e
 
 ## Install and start (one download)
 
-1. Download **`LocalAIVtuber-vX.Y.Z.zip`** from the [Releases page](../../releases) and extract it anywhere. Avoid OneDrive or other synced folders: models are large.
+1. Download **`LocalAIVtuber-vX.Y.Z.zip`** from the [Releases page](https://github.com/CtrlAltDefeat55/LocalAIVtuber2/releases) and extract it anywhere. Avoid OneDrive or other synced folders: models are large.
 2. Start it with the script for your system:
    - **Windows:** double-click **`Start Windows.bat`**
    - **macOS (Apple Silicon):** double-click **`Start Mac.command`**. The first time, macOS may ask you to confirm: right-click, then **Open**.
