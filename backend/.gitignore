@@ -1,6 +1,8 @@
 venv
 *.log
-*.png
+# screenshots written by vision features (character textures must stay tracked)
+services/LLM/*.png
+services/Input/*.png
 *__pycache__
 *.zip
 *.exe

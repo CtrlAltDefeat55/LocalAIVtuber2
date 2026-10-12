@@ -94,7 +94,7 @@ const VRM3dCanvas: React.FC<VRM3dCanvasProps> = ({ modelPath }) => {
       if (!backgroundTextureRef.current?.image) return; // Add null check
       // When factor larger than 1, that means texture 'wilder' than target。 
       // we should scale texture height to target height and then 'map' the center  of texture to target， and vice versa.
-      const targetAspect = window.innerWidth / window.innerHeight;
+      const targetAspect = (mountNode?.clientWidth || window.innerWidth) / (mountNode?.clientHeight || window.innerHeight);
       const imageAspect = backgroundTextureRef.current?.image.width / backgroundTextureRef.current?.image.height;
       const factor = imageAspect / targetAspect;
       if (scene.background instanceof THREE.Texture) {
@@ -211,13 +211,18 @@ const VRM3dCanvas: React.FC<VRM3dCanvasProps> = ({ modelPath }) => {
       renderer.setAnimationLoop(animate);
 
     };
+    // Size to our own box (it changes with the sidebar, inspector panel and window).
     const handleResize = () => {
+      const width = mountNode?.clientWidth || 1;
+      const height = mountNode?.clientHeight || 1;
       updateBackground();
-      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.aspect = width / height;
       camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setSize(width, height);
     };
     window.addEventListener('resize', handleResize);
+    const resizeObserver = new ResizeObserver(handleResize);
+    if (mountNode) resizeObserver.observe(mountNode);
 
     // setup listener for click events
     const raycaster = new THREE.Raycaster();
@@ -233,8 +238,9 @@ const VRM3dCanvas: React.FC<VRM3dCanvasProps> = ({ modelPath }) => {
 
       if (!canClickRef.current || lastPlayedGestureRef.current?.isRunning()) return;
       // Calculate mouse position in normalized device coordinates
-      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
-      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 
       // Update the raycaster with the camera and mouse position
       raycaster.setFromCamera(mouse, camera);
@@ -288,6 +294,8 @@ const VRM3dCanvas: React.FC<VRM3dCanvasProps> = ({ modelPath }) => {
         controls.dispose();
 
         // Remove event listeners
+        resizeObserver.disconnect();
+        renderer.setAnimationLoop(null);
         window.removeEventListener('resize', handleResize);
         window.removeEventListener('click', onMouseClick);
 
@@ -376,7 +384,7 @@ const VRM3dCanvas: React.FC<VRM3dCanvasProps> = ({ modelPath }) => {
 
   };
 
-  return <div ref={mountRef} />;
+  return <div ref={mountRef} className="h-full w-full overflow-hidden" />;
 };
 
 export default VRM3dCanvas;

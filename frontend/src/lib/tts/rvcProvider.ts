@@ -43,17 +43,31 @@ export class RVCProvider extends BaseTTSProvider {
     }
 
     private async fetchVoices() {
-        const response = await fetch('/api/rvc/models');
-        const data = await response.json();
-        this.voices = data.models.map((model: RVCModel) => model.name);
-        this.notifySubscribers();
+        try {
+            const response = await fetch('/api/rvc/models');
+            if (!response.ok) return; // RVC plugin not installed
+            const data = await response.json();
+            this.voices = data.models.map((model: RVCModel) => model.name);
+            this.notifySubscribers();
+        } catch {
+            /* RVC unavailable */
+        }
     }
 
     private async fetchEdgeVoices() {
-        const response = await fetch('/api/rvc/edge-models');
-        const data = await response.json();
-        this.edgeVoices = data.models;
-        this.notifySubscribers();
+        try {
+            const response = await fetch('/api/rvc/edge-models');
+            if (!response.ok) return;
+            const data = await response.json();
+            this.edgeVoices = data.models;
+            this.notifySubscribers();
+        } catch {
+            /* RVC unavailable */
+        }
+    }
+
+    isAvailable(): boolean {
+        return this.edgeVoices.length > 0 || this.voices.length > 0;
     }
 
     getVoices(): string[] {
@@ -101,7 +115,7 @@ export class RVCProvider extends BaseTTSProvider {
         this.notifySubscribers();
     }
 
-    async generateAudio(text: string): Promise<Response> {
+    async generateAudio(text: string, signal?: AbortSignal): Promise<Response> {
         if (!this.currentVoice || !this.currentEdgeVoice) {
             throw new Error("RVC model and Edge TTS voice must be selected");
         }
@@ -115,7 +129,8 @@ export class RVCProvider extends BaseTTSProvider {
                 model_name: this.currentVoice,
                 use_rvc: this.useRVC,
                 f0_up_key: this.f0_up_key
-            })
+            }),
+            signal,
         });
 
         if (!response.ok) {

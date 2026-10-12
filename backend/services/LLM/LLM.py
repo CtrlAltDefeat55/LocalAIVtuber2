@@ -1,273 +1,390 @@
+import asyncio
+import base64
+import io
 import json
+import math
 import os
-import shutil
-from services.lib.LAV_logger import logger
+import re
+import threading
+from typing import AsyncGenerator, Optional
 
-from .BaseLLM import BaseLLM
-from .TextLLM import TextLLM
-from .VisionLLM import VisionLLM
+import httpx
+
+from services.lib.LAV_logger import logger
+from services.lib.paths import LLM_MODELS_DIR
+from .llama_server import LlamaServer, find_llama_server
+
+# Rough characters-per-token used to keep requests inside the context window
+# without a tokenizer round-trip per message.
+CHARS_PER_TOKEN = 3.5
 
 
 class LLM:
-    def __init__(self, gpu_layers=-1):
-        self.current_module_directory = os.path.dirname(__file__)
-        self.models_directory = os.path.join(self.current_module_directory, "Models")
-        self.current_model_data = None
-        self.llm: BaseLLM | None = None
-        self.all_model_data = None
-        self.keep_model_loaded = False
-        
-        # Default sampling parameters
+    """Model catalog + a llama-server process serving the selected model.
+
+    State machine (exposed to the UI via `status()`):
+      stopped -> loading -> ready
+                        \\-> error   (message in `error`)
+    """
+
+    def __init__(self):
+        self.models_directory = str(LLM_MODELS_DIR)
+        os.makedirs(self.models_directory, exist_ok=True)
+        self.server = LlamaServer()
+        self.all_model_data: list = []
+        self.current_model_data: Optional[dict] = None
+        self.keep_model_loaded = True
+        self.state = "stopped"
+        self.error: Optional[str] = None
+        self.loaded_model_id: Optional[str] = None
+        self._lock = threading.Lock()
+        self._generation = 0  # bumps on every load request so stale loads cancel themselves
+
         self.sampling_params = {
-            'top_k': 40,
-            'top_p': 0.95,
-            'min_p': 0.05,
-            'repeat_penalty': 1.1,
-            'temperature': 0.8,
-            'seed': -1
+            'top_k': 40, 'top_p': 0.95, 'min_p': 0.05,
+            'repeat_penalty': 1.1, 'temperature': 0.8, 'seed': -1,
         }
-
-        # Initialize models directory if it doesn't exist
-        if not os.path.exists(self.models_directory):
-            os.makedirs(self.models_directory)
-
-        # Load available models
+        self.runtime_options = {
+            "context_size": 8192,
+            "gpu_layers": "auto",
+            "cpu_only": False,
+            "enable_vision": False,
+            "thinking": False,
+            "max_tokens": 512,
+        }
         self._load_available_models()
-        
-        if self.keep_model_loaded and self.current_model_data:
-            self.load_model(self.current_model_data, gpu_layers)
+
+    # ------------------------------------------------------------------ catalog
 
     def _load_available_models(self):
-        """Load all available models from metadata.json files, regardless of folder names"""
-        self.all_model_data = []
-        
-        # Walk through all directories and subdirectories to find metadata files
+        """Scan Models/: every folder with metadata.json is a catalog entry.
+
+        `local.json` (not tracked by git) records what was actually downloaded.
+        Loose .gguf files dropped into Models/ by hand are picked up too.
+        """
+        models = []
         for root, dirs, files in os.walk(self.models_directory):
-            # Look for metadata files with various naming conventions
-            metadata_files = ['metadata.json']
-            
-            for metadata_file in metadata_files:
-                if metadata_file in files:
-                    metadata_path = os.path.join(root, metadata_file)
-                    try:
-                        with open(metadata_path, 'r', encoding='utf-8') as f:
-                            model_data = json.load(f)
-                        
-                        # Add additional information
-                        model_data['metadata_path'] = metadata_path
-                        model_data['model_folder'] = root
-                        
-                        # Check if model file exists and get its size
-                        model_file_path = os.path.join(root, model_data.get('fileName', ''))
-                        model_data['file_exists'] = os.path.exists(model_file_path)
-                        
-                        if model_data['file_exists']:
-                            try:
-                                file_size = os.path.getsize(model_file_path)
-                                model_data['file_size_bytes'] = file_size
-                                model_data['file_size_readable'] = self._format_file_size(file_size)
-                            except OSError:
-                                model_data['file_size_bytes'] = 0
-                                model_data['file_size_readable'] = "Unknown"
-                        else:
-                            model_data['file_size_bytes'] = 0
-                            model_data['file_size_readable'] = "Not Downloaded"
-                        
-                        # Add vision model support check
-                        if model_data.get('type') == 'vision':
-                            mmproj_path = model_data.get('mmproj_path', '')
-                            if mmproj_path:
-                                full_mmproj_path = os.path.join(root, mmproj_path)
-                                model_data['mmproj_exists'] = os.path.exists(full_mmproj_path)
-                            else:
-                                model_data['mmproj_exists'] = False
-                        
-                        self.all_model_data.append(model_data)
-                        logger.debug(f"Loaded model metadata: {model_data.get('displayName', 'Unknown')} from {metadata_path}")
-                        
-                    except (json.JSONDecodeError, IOError) as e:
-                        logger.warning(f"Could not load metadata from {metadata_path}: {e}")
-                    break  # Only process the first metadata file found in each directory
-        
-        # Set current model if not set
-        if not self.current_model_data and self.all_model_data:
-            # Prefer a model that actually exists
-            existing_models = [m for m in self.all_model_data if m.get('file_exists', False)]
-            if existing_models:
-                self.current_model_data = existing_models[0]
-            else:
-                self.current_model_data = self.all_model_data[0]
-        
-        logger.info(f"Loaded {len(self.all_model_data)} models from metadata files")
+            dirs.sort()
+            if "metadata.json" not in files:
+                continue
+            metadata_path = os.path.join(root, "metadata.json")
+            try:
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                local_path = os.path.join(root, "local.json")
+                if os.path.isfile(local_path):
+                    with open(local_path, "r", encoding="utf-8") as f:
+                        data.update(json.load(f))
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Could not load metadata from {metadata_path}: {e}")
+                continue
+            data["id"] = os.path.relpath(root, self.models_directory).replace(os.sep, "/")
+            models.append(self._describe(data, root, metadata_path))
 
-    def _format_file_size(self, size_bytes):
-        """Format file size in human readable format"""
-        if size_bytes == 0:
+        known = {os.path.normcase(os.path.join(m["model_folder"], m.get("fileName") or "")) for m in models}
+        for root, _dirs, files in os.walk(self.models_directory):
+            if "metadata.json" in files:
+                continue
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                low = name.lower()
+                if not low.endswith(".gguf") or "mmproj" in low or os.path.normcase(path) in known:
+                    continue
+                if re.search(r"-0000[2-9]-of-\d{5}\.gguf$", low):
+                    continue  # later parts of a split model
+                projs = [f for f in files if "mmproj" in f.lower() and f.lower().endswith(".gguf")]
+                data = {"displayName": os.path.splitext(name)[0], "fileName": name, "type": "text",
+                        "description": "Added from the Models folder.", "local_only": True,
+                        "mmproj_path": projs[0] if projs else None,
+                        "id": "file:" + os.path.relpath(path, self.models_directory).replace(os.sep, "/")}
+                models.append(self._describe(data, root, None))
+
+        models.sort(key=lambda m: (not m.get("recommended", False), m.get("order", 100), m.get("displayName", "")))
+        self.all_model_data = models
+
+        if self.current_model_data:
+            self.current_model_data = self.get_model(self.current_model_data.get("id"))
+        if not self.current_model_data and models:
+            existing = [m for m in models if m["file_exists"]]
+            self.current_model_data = (existing or models)[0]
+
+    def _describe(self, data: dict, root: str, metadata_path: Optional[str]) -> dict:
+        data["metadata_path"] = metadata_path
+        data["model_folder"] = root
+        file_name = data.get("fileName") or ""
+        data["file_exists"] = bool(file_name) and os.path.isfile(os.path.join(root, file_name))
+        if data["file_exists"]:
+            parts = data.get("parts") or [file_name]
+            size = sum(os.path.getsize(os.path.join(root, p)) for p in parts if os.path.isfile(os.path.join(root, p)))
+            data["file_size_bytes"] = size
+            data["file_size_readable"] = self._format_file_size(size)
+        else:
+            data["file_size_bytes"] = 0
+            data["file_size_readable"] = data.get("size_hint") or "Not downloaded"
+        mmproj = data.get("mmproj_path")
+        data["mmproj_exists"] = bool(mmproj) and os.path.isfile(os.path.join(root, mmproj))
+        data["downloadable"] = bool(data.get("link") or data.get("repo"))
+        return data
+
+    def get_model(self, model_id_or_file: Optional[str]) -> Optional[dict]:
+        if not model_id_or_file:
+            return None
+        for m in self.all_model_data:
+            if model_id_or_file in (m.get("id"), m.get("fileName"), m.get("displayName")):
+                return m
+        return None
+
+    @staticmethod
+    def _format_file_size(size_bytes):
+        if not size_bytes:
             return "0 B"
-        
-        size_names = ["B", "KB", "MB", "GB", "TB"]
-        import math
-        i = int(math.floor(math.log(size_bytes, 1024)))
-        p = math.pow(1024, i)
-        s = round(size_bytes / p, 2)
-        return f"{s} {size_names[i]}"
+        names = ["B", "KB", "MB", "GB", "TB"]
+        i = min(int(math.floor(math.log(size_bytes, 1024))), len(names) - 1)
+        return f"{round(size_bytes / math.pow(1024, i), 2)} {names[i]}"
 
-    def get_model_download_info(self, model_data):
-        """Get download information for a specific model"""
+    def status(self) -> dict:
+        model = self.current_model_data or {}
         return {
-            'displayName': model_data.get('displayName', 'Unknown'),
-            'fileName': model_data.get('fileName', ''),
-            'link': model_data.get('link', ''),
-            'type': model_data.get('type', 'text'),
-            'file_exists': model_data.get('file_exists', False),
-            'file_size_readable': model_data.get('file_size_readable', 'Unknown'),
-            'model_folder': model_data.get('model_folder', '')
+            "state": self.state,
+            "error": self.error,
+            "runtime_installed": find_llama_server() is not None,
+            "model_id": model.get("id"),
+            "model_name": model.get("displayName"),
+            "model_downloaded": bool(model.get("file_exists")),
+            "loaded_model_id": self.loaded_model_id,
+            "vision_active": bool(self.server.mmproj_path),
+            "options": self.runtime_options,
         }
 
-    def _migrate_old_structure(self):
-        """Migrate from old structure to new folder-based structure"""
-        old_model_data_path = os.path.join(self.current_module_directory, "model_data.json")
-        if not os.path.exists(old_model_data_path):
-            return
+    # ------------------------------------------------------------------ lifecycle
 
-        with open(old_model_data_path, 'r') as f:
-            old_model_data = json.load(f)
-
-        for model_data in old_model_data:
-            model_name = model_data["fileName"]
-            model_folder = os.path.join(self.models_directory, os.path.splitext(model_name)[0])
-            
-            # Create model folder if it doesn't exist
-            if not os.path.exists(model_folder):
-                os.makedirs(model_folder)
-
-            # Move model file to its folder
-            old_model_path = os.path.join(self.models_directory, model_name)
-            new_model_path = os.path.join(model_folder, model_name)
-            if os.path.exists(old_model_path) and not os.path.exists(new_model_path):
-                shutil.move(old_model_path, new_model_path)
-
-            # Create metadata.json in model folder
-            metadata_path = os.path.join(model_folder, "metadata.json")
-            if not os.path.exists(metadata_path):
-                with open(metadata_path, 'w') as f:
-                    json.dump(model_data, f, indent=4)
-
-        # Remove old model_data.json
-        os.remove(old_model_data_path)
-
-    def load_model_by_filename(self, model_filename: str, gpu_layers=-1):
-        """Load a model by its filename"""
+    def select_model(self, model_id: str, load: Optional[bool] = None) -> bool:
         self._load_available_models()
-        for model_data in self.all_model_data:
-            if model_data.get("fileName") == model_filename:
-                self.load_model(model_data, gpu_layers)
-                return True
-        logger.error(f"Model {model_filename} not found.")
-        return False
-        
-    def load_model(self, model_data: dict, gpu_layers=-1):
-        """Load a model using its metadata"""
-        logger.debug(f"Loading model {model_data}...")
-        if (self.llm and self.current_model_data.get('fileName') == model_data.get('fileName')):
-            logger.debug(f"Same model already loaded, load cancelled...")
-            return
+        model = self.get_model(model_id)
+        if not model:
+            logger.error(f"Model {model_id} not found.")
+            return False
+        changed = (self.current_model_data or {}).get("id") != model["id"]
+        self.current_model_data = model
+        if changed:
+            self.error = None
+            if self.state == "error":
+                self.state = "stopped"
+            if self.loaded_model_id and self.loaded_model_id != model["id"]:
+                self.unload_model()
+        if (load if load is not None else self.keep_model_loaded) and model.get("file_exists"):
+            self.load_in_background()
+        return True
 
-        self.current_model_data = model_data
-        model_name = model_data.get("fileName")
-        
-        # Use the model_folder from metadata if available, otherwise fall back to old method
-        if 'model_folder' in model_data:
-            model_folder = model_data['model_folder']
-        else:
-            model_folder = os.path.join(self.models_directory, os.path.splitext(model_name)[0])
-        
-        model_path = os.path.join(model_folder, model_name)
+    # Back-compat with settings written by older versions ("llm.model_filename")
+    def load_model_by_filename(self, model_filename: str):
+        return self.select_model(model_filename)
 
-        if not os.path.exists(model_path):
-            logger.error(f"Model {model_name} not found at {model_path}. Please download the model first.")
+    def set_runtime_options(self, **options):
+        changed = {k: v for k, v in options.items() if self.runtime_options.get(k) != v}
+        if not changed:
             return
-        else:
+        self.runtime_options.update(changed)
+        restart_keys = {"context_size", "gpu_layers", "cpu_only", "enable_vision"}
+        if restart_keys & changed.keys() and self.loaded_model_id:
+            logger.info(f"LLM runtime options changed ({', '.join(changed)}), reloading model")
             self.unload_model()
-            if model_data.get("type") == "text":
-                self.llm = TextLLM(model_path=model_path, n_ctx=4096, n_gpu_layers=gpu_layers, seed=-1)
-            elif model_data.get("type") == "vision":
-                mmproj_path = model_data.get("mmproj_path")
-                if mmproj_path:
-                    full_mmproj_path = os.path.join(model_folder, mmproj_path)
-                    if os.path.exists(full_mmproj_path):
-                        self.llm = VisionLLM(model_path=model_path, mmproj_path=full_mmproj_path, n_ctx=4096, n_gpu_layers=gpu_layers, seed=-1)
-                    else:
-                        logger.error(f"Vision model mmproj file not found: {full_mmproj_path}")
-                        return
-                else:
-                    logger.error(f"Vision model missing mmproj_path in metadata")
-                    return
+            if self.keep_model_loaded:
+                self.load_in_background()
 
-            logger.info(f"Model changed to {model_name}.")
+    def load_in_background(self):
+        threading.Thread(target=self._safe_load, daemon=True).start()
+
+    def _safe_load(self):
+        try:
+            self.load_model(self.current_model_data)
+        except Exception as e:
+            logger.error(f"Model load failed: {e}")
+
+    def load_model(self, model_data: Optional[dict] = None):
+        """Blocking: start llama-server with the model. Safe to call repeatedly."""
+        model_data = model_data or self.current_model_data
+        if not model_data:
+            self.state, self.error = "error", "No model selected. Pick or download a model on the Brain page."
+            raise RuntimeError(self.error)
+        self._generation += 1
+        generation = self._generation
+        with self._lock:
+            if generation != self._generation:
+                return  # a newer request superseded this one while we waited
+            if self.loaded_model_id == model_data["id"] and self.server.is_running():
+                self.state = "ready"
+                return
+            folder = model_data["model_folder"]
+            model_path = os.path.join(folder, model_data.get("fileName") or "")
+            if not model_data.get("fileName") or not os.path.isfile(model_path):
+                self.state = "error"
+                self.error = f"{model_data.get('displayName')} is not downloaded yet."
+                raise RuntimeError(self.error)
+            mmproj = None
+            if self.runtime_options["enable_vision"] and model_data.get("mmproj_path"):
+                candidate = os.path.join(folder, model_data["mmproj_path"])
+                mmproj = candidate if os.path.isfile(candidate) else None
+            self.state, self.error = "loading", None
+            self.current_model_data = model_data
+            gpu_layers = "0" if self.runtime_options["cpu_only"] else self.runtime_options["gpu_layers"]
+            try:
+                self.server.start(model_path, mmproj, self.runtime_options["context_size"], gpu_layers,
+                                  is_cancelled=lambda: generation != self._generation)
+            except Exception as e:
+                self.loaded_model_id = None
+                if generation == self._generation:
+                    self.state, self.error = "error", str(e)
+                raise
+            self.loaded_model_id = model_data["id"]
+            self.state = "ready"
+            logger.info(f"Model ready: {model_data.get('displayName')}")
 
     def unload_model(self):
-        if self.llm:
-            del self.llm
-            self.llm = None
-            logger.info("Model unloaded.")
+        self._generation += 1  # cancels an in-flight load
+        self.server.stop()
+        self.loaded_model_id = None
+        if self.state != "error":
+            self.state = "stopped"
+        logger.info("Model unloaded.")
 
     def set_keep_model_loaded(self, value):
-        self.keep_model_loaded = value
-        if value == True:
-            self.load_model(self.current_model_data)
-        else:
-            self.unload_model()
+        self.keep_model_loaded = bool(value)
+        if self.keep_model_loaded:
+            if self.current_model_data and self.current_model_data.get("file_exists") and not self.loaded_model_id:
+                self.load_in_background()
 
     def update_sampling_params(self, params: dict):
-        """Update sampling parameters - no model reload needed as these are inference-time parameters"""
         self.sampling_params.update(params)
         logger.info(f"Updated sampling parameters: {self.sampling_params}")
 
-    def get_completion(self, text, history, system_prompt, screenshot=False):
-        if not self.llm:
-            self.load_model(self.current_model_data)
+    async def ensure_loaded(self):
+        if self.loaded_model_id == (self.current_model_data or {}).get("id") and self.server.is_running():
+            return
+        await asyncio.to_thread(self.load_model, self.current_model_data)
 
-        response = None
-        if isinstance(self.llm, VisionLLM):
-            self.llm: VisionLLM
-            response = self.llm.get_chat_completion(text, history, system_prompt, screenshot)
-        elif isinstance(self.llm, TextLLM):
-            self.llm: TextLLM
-            response = self.llm.get_chat_completion(
-                text, 
-                history, 
-                system_prompt,
-                top_k=self.sampling_params['top_k'],
-                top_p=self.sampling_params['top_p'],
-                min_p=self.sampling_params['min_p'],
-                repeat_penalty=self.sampling_params['repeat_penalty'],
-                temperature=self.sampling_params['temperature'],
-                seed=self.sampling_params['seed']
-            )
+    # ------------------------------------------------------------------ inference
+
+    def _sampling(self) -> dict:
+        p = self.sampling_params
+        out = {
+            "temperature": p["temperature"], "top_k": p["top_k"], "top_p": p["top_p"],
+            "min_p": p["min_p"], "repeat_penalty": p["repeat_penalty"],
+        }
+        if int(p.get("seed", -1)) >= 0:
+            out["seed"] = int(p["seed"])
+        return out
+
+    def _fit_context(self, messages: list) -> list:
+        budget = int(self.runtime_options["context_size"]) - int(self.runtime_options["max_tokens"]) - 256
+
+        def tokens(msg):
+            content = msg["content"]
+            if isinstance(content, list):  # multimodal parts: count text only, images cost ~1k tokens
+                return sum(len(c.get("text", "")) / CHARS_PER_TOKEN if c.get("type") == "text" else 1024
+                           for c in content)
+            return len(content) / CHARS_PER_TOKEN
+
+        while sum(tokens(m) for m in messages) > budget and len(messages) > 2:
+            messages.pop(1)  # drop the oldest turn after the system prompt
+        return messages
+
+    def _template_kwargs(self) -> dict:
+        return {"chat_template_kwargs": {"enable_thinking": bool(self.runtime_options["thinking"])}}
+
+    def _screenshot_part(self) -> Optional[dict]:
+        if not self.server.mmproj_path:
+            logger.info("Screenshot requested but vision is not active for this model; sending text only.")
+            return None
+        try:
+            import mss
+            from PIL import Image
+            with mss.mss() as sct:
+                shot = sct.grab(sct.monitors[1])
+                img = Image.frombytes("RGB", shot.size, shot.rgb)
+            img.thumbnail((1280, 1280))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            return {"type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()}}
+        except Exception as e:
+            logger.warning(f"Screenshot failed: {e}")
+            return None
+
+    async def get_completion(self, text, history, system_prompt, screenshot=False) -> AsyncGenerator[str, None]:
+        await self.ensure_loaded()
+        messages = [{"role": "system", "content": system_prompt or ""}]
+        messages += [m for m in (history or []) if m.get("content")]
+        user_content = text
+        if screenshot:
+            part = await asyncio.to_thread(self._screenshot_part)
+            if part:
+                user_content = [part, {"type": "text", "text": text}]
+        messages.append({"role": "user", "content": user_content})
+        body = {"messages": self._fit_context(messages), "stream": True,
+                "max_tokens": int(self.runtime_options["max_tokens"]), **self._sampling(), **self._template_kwargs()}
+        async for chunk in self._stream(f"{self.server.base_url}/v1/chat/completions", body, chat=True):
+            yield chunk
+        self._maybe_unload()
+
+    async def complete_current_response(self, history, system_prompt) -> AsyncGenerator[str, None]:
+        """Continue the last (partial) assistant message in `history`."""
+        if not history:
+            return
+        await self.ensure_loaded()
+        messages = [{"role": "system", "content": system_prompt or ""}] + list(history)
+        partial = ""
+        if messages[-1]["role"] == "assistant":
+            partial = messages.pop()["content"]
+        messages = self._fit_context(messages)
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(f"{self.server.base_url}/apply-template",
+                                  json={"messages": messages, **self._template_kwargs()})
+            r.raise_for_status()
+            prompt = r.json()["prompt"] + partial
+        body = {"prompt": prompt, "stream": True, "n_predict": int(self.runtime_options["max_tokens"]) * 2,
+                **self._sampling()}
+        async for chunk in self._stream(f"{self.server.base_url}/completion", body, chat=False):
+            yield chunk
+        self._maybe_unload()
+
+    async def _stream(self, url: str, body: dict, chat: bool) -> AsyncGenerator[str, None]:
+        in_think = False
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=300, write=60, pool=10)) as client:
+            async with client.stream("POST", url, json=body) as resp:
+                if resp.status_code != 200:
+                    detail = (await resp.aread()).decode(errors="replace")[:500]
+                    raise RuntimeError(f"LLM request failed ({resp.status_code}): {detail}")
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    piece = (data["choices"][0]["delta"].get("content") if chat else data.get("content")) or ""
+                    # Hide any inline reasoning a template emits even with thinking off.
+                    out = ""
+                    while piece:
+                        if in_think:
+                            end = piece.find("</think>")
+                            if end < 0:
+                                break
+                            piece, in_think = piece[end + 8:].lstrip(), False
+                        else:
+                            start = piece.find("<think>")
+                            if start < 0:
+                                out += piece
+                                break
+                            out, piece, in_think = out + piece[:start], piece[start + 7:], True
+                    if out:
+                        yield out
+                    if not chat and data.get("stop"):
+                        break
+
+    def _maybe_unload(self):
         if not self.keep_model_loaded:
             self.unload_model()
-        return response
-
-    def complete_current_response(self, history, system_prompt):
-        """Complete the current response with sampling parameters from settings"""
-        if not self.llm:
-            self.load_model(self.current_model_data)
-
-        response = None
-        if isinstance(self.llm, TextLLM):
-            self.llm: TextLLM
-            response = self.llm.complete_current_response(
-                history, 
-                system_prompt,
-                top_k=self.sampling_params['top_k'],
-                top_p=self.sampling_params['top_p'],
-                min_p=self.sampling_params['min_p'],
-                repeat_penalty=self.sampling_params['repeat_penalty'],
-                temperature=self.sampling_params['temperature'],
-                seed=self.sampling_params['seed']
-            )
-        
-        if not self.keep_model_loaded:
-            self.unload_model()
-        return response

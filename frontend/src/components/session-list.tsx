@@ -1,3 +1,4 @@
+import { PageHeader } from './layout';
 import { useEffect, useState } from 'react';
 import { Search, Calendar, Database, RefreshCcw, ArrowUpFromLine } from 'lucide-react';
 import { Button } from './ui/button';
@@ -157,15 +158,13 @@ export default function SessionList() {
     }
 
     return (
-        <div className="mt-10">
+        <div className="px-8 py-8">
             <div className="max-w-6xl mx-auto">
-                <div className="mb-8">
-                    <h1 className="text-3xl font-bold mb-2">Chat Sessions</h1>
-                    <p className="">Manage and review your conversation sessions</p>
-                </div>
+                <PageHeader icon={Database} title="Memory"
+                    description="Your past conversations. Index a chat to add it to long-term memory, so the VTuber can recall it later. You can also edit chats and export them as training data." />
 
                 {/* Filters and Search */}
-                <div className="rounded-lg shadow-sm border p-6 mb-6">
+                <div className="rounded-2xl bg-card shadow-xs border p-4 mb-6">
                     <div className="flex flex-col md:flex-row gap-4">
                         <div className="flex-1">
                             <div className="relative">

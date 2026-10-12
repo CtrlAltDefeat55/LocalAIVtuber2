@@ -57,13 +57,15 @@ export function SidePanel({
             }}
         >
             <button
-                className={`absolute ${side === "right" ? "left-[-25px] rounded-l-sm" : "right-[-25px] rounded-r-sm"} border bg-background dark:border-input ${toggleText ? 'px-0.5 py-1.5' : 'p-0'}`}
+                className={`absolute ${side === "right" ? "left-[-28px] rounded-l-lg border-r-0" : "right-[-28px] rounded-r-lg border-l-0"} border bg-sidebar text-muted-foreground shadow-sm hover:text-foreground ${toggleText ? 'px-1 py-2' : 'p-1'}`}
                 style={{ top: `${togglePosition}px` }}
                 onClick={toggleSidePanel}
+                aria-expanded={isSidePanelOpen}
+                aria-label={isSidePanelOpen ? "Close panel" : "Open panel"}
             >
                 {renderToggleContent()}
             </button>
-            <ScrollArea className="h-full flex flex-col gap-2 items-start rounded-none p-5" style={{width: `${width}px`, background: "#151515"}}>
+            <ScrollArea className={`h-full flex flex-col gap-2 items-start rounded-none bg-sidebar p-5 shadow-lg ${side === "right" ? "border-l" : "border-r"}`} style={{width: `${width}px`}}>
                 {children}
             </ScrollArea>
         </div>

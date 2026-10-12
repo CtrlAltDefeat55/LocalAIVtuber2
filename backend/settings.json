@@ -1,10 +1,15 @@
 {
-    "frontend.character.selectedLive2DModel": "/resource/live2D/models/akari_vts/akari.model3.json",
-    "frontend.character.selectedVRMModel": "/resource/VRM3D/models/\u751f\u99d2\u30df\u30eb_\u79c1\u670d.vrm",
-    "llm.showMonitor": true,
+    "llm.model_id": "Qwen3.8-27B-abliterated-IQ3_S",
     "llm.keep_model_loaded": true,
-    "llm.model_filename": "conversational-7b-v0.4-q4_k_m.gguf",
-    "llm.system_prompt": "You are Aya.",
+    "llm.context_size": 8192,
+    "llm.system_prompt": "You are Aya, a playful and witty VTuber streaming live. Keep replies short and conversational (one to three sentences), speak naturally as if talking out loud, and never use emoji, markdown or stage directions.",
     "llm.enableMemoryRetrieval": true,
-    "frontend.character.renderModel": true
+    "llm.showMonitor": false,
+    "tts.engine": "chatterbox",
+    "tts.voice": "leaf",
+    "frontend.character.renderModel": true,
+    "frontend.character.3d2dSwitch": false,
+    "frontend.character.selectedLive2DModel": "/api/character/files/live2D/models/akari_vts/akari.model3.json",
+    "frontend.character.selectedVRMModel": "/api/character/files/VRM3D/models/生駒ミル_私服.vrm",
+    "tts.enabled": true
 }

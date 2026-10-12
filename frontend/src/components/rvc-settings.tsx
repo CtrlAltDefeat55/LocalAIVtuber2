@@ -15,7 +15,7 @@ export default function RvcSettings() {
     const [edgeModels, setEdgeModels] = useState<string[]>([]);
     const [downloadUrl, setDownloadUrl] = useState("");
     const [isDownloading, setIsDownloading] = useState(false);
-    const provider = ttsManager.getCurrentProviderInstance() as RVCProvider;
+    const provider = ttsManager.getProvider<RVCProvider>("rvc");
 
     useEffect(() => {
         // Initial state

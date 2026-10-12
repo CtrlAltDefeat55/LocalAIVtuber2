@@ -1,0 +1,14 @@
+# Created by the installer / at runtime - never committed
+/runtime/
+/cache/
+/dist/
+/LocalAIVtuber*.zip
+backend/ffmpeg*
+backend/ffprobe*
+backend/services/LLM/Models/custom/
+backend/services/Memory/data/
+backend/services/Memory/chat_sessions/
+*.part
+.DS_Store
+__pycache__/
+*.pyc

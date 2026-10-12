@@ -1,6 +1,8 @@
+import io
 import os
 import logging
 import shutil
+import zipfile
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
@@ -36,28 +38,52 @@ class CharacterManager:
         self.live2d_path.mkdir(parents=True, exist_ok=True)
         self.vrm_path.mkdir(parents=True, exist_ok=True)
 
-    def upload_vrm_model(self, file_data: bytes, filename: str) -> Tuple[bool, str]:
-        """Upload a VRM model file"""
+    def upload_vrm_model(self, file_data: bytes, filename: str, replace: bool = False) -> Tuple[bool, str]:
+        """Upload a VRM model file. With `replace`, an existing model of the same name is updated."""
         try:
             if not filename.lower().endswith('.vrm'):
                 return False, "File must be a .vrm file"
+            if file_data[:4] != b"glTF":
+                return False, "This file is not a valid VRM (glTF binary) model"
 
             # Clean filename and create target path
             safe_filename = self._sanitize_filename(filename)
             target_path = self.vrm_path / safe_filename
+            if target_path.exists() and not replace:
+                return False, f"A model named '{safe_filename}' already exists. Use Replace to update it."
 
-            # Write the file
-            with open(target_path, 'wb') as f:
+            # Write to a temp file first so a failed upload never corrupts the existing model
+            tmp_path = target_path.with_suffix(".uploading")
+            with open(tmp_path, 'wb') as f:
                 f.write(file_data)
+            os.replace(tmp_path, target_path)
 
             logger.info(f"Successfully uploaded VRM model: {safe_filename}")
-            return True, "Model uploaded successfully"
+            return True, "Model updated" if replace else "Model uploaded successfully"
 
         except Exception as e:
             logger.error(f"Error uploading VRM model: {e}", exc_info=True)
             return False, f"Failed to upload model: {str(e)}"
 
-    def upload_live2d_folder(self, files: List[Tuple[str, bytes]]) -> Tuple[bool, str]:
+    def upload_live2d_zip(self, zip_data: bytes, filename: str, replace: bool = False,
+                          target_name: str = "") -> Tuple[bool, str]:
+        """Install a Live2D model from a .zip (the folder containing the .model3.json is used)."""
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(zip_data))
+        except zipfile.BadZipFile:
+            return False, "That file is not a valid .zip archive"
+        names = [n for n in archive.namelist() if not n.endswith('/') and '__MACOSX' not in n]
+        model_files = [n for n in names if n.lower().endswith('.model3.json')]
+        if not model_files:
+            return False, "No .model3.json found in the zip. Live2D Cubism 3/4 models are required."
+        model_file = min(model_files, key=lambda n: n.count('/'))
+        root = model_file.rsplit('/', 1)[0] + '/' if '/' in model_file else ''
+        folder_name = target_name or (root.rstrip('/').rsplit('/', 1)[-1] if root else os.path.splitext(filename)[0])
+        files = [(folder_name + '/' + n[len(root):], archive.read(n)) for n in names if n.startswith(root)]
+        return self.upload_live2d_folder(files, replace=replace)
+
+    def upload_live2d_folder(self, files: List[Tuple[str, bytes]], replace: bool = False,
+                             target_name: str = "") -> Tuple[bool, str]:
         """Upload a Live2D model folder
         Args:
             files: List of tuples containing (relative_path, file_data)
@@ -66,36 +92,47 @@ class CharacterManager:
             if not files:
                 return False, "No files provided"
 
-            # Get folder name from the first file's path
+            # Get folder name from the first file's path (or the model being replaced)
             first_file_path = files[0][0]
-            folder_name = first_file_path.split('/')[0]
+            folder_name = target_name or first_file_path.replace('\\', '/').split('/')[0]
             if not folder_name:
                 return False, "Invalid folder structure"
 
+            if not any(p.lower().endswith('.model3.json') for p, _ in files):
+                return False, "No .model3.json file found. Select the model's folder (Cubism 3/4 format)."
+
             # Clean folder name
             safe_folder_name = self._sanitize_filename(folder_name)
-            target_folder = self.live2d_path / safe_folder_name
+            if not safe_folder_name:
+                return False, "Invalid folder name"
+            final_folder = self.live2d_path / safe_folder_name
+            if final_folder.exists() and not replace:
+                return False, f"A model named '{safe_folder_name}' already exists. Use Replace to update it."
 
-            # Create target folder
-            target_folder.mkdir(parents=True, exist_ok=True)
+            # Assemble in a staging folder, then swap it in, so a failed upload keeps the old model intact
+            target_folder = self.live2d_path / f".{safe_folder_name}.uploading"
+            shutil.rmtree(target_folder, ignore_errors=True)
+            target_folder.mkdir(parents=True)
+            staging_root = target_folder.resolve()
 
-            # Write all files
             for relative_path, file_data in files:
                 # Remove the root folder name from path
-                sub_path = '/'.join(relative_path.split('/')[1:])
+                sub_path = '/'.join(relative_path.replace('\\', '/').split('/')[1:])
                 if not sub_path:
                     continue
-
-                # Create full target path
-                full_target_path = target_folder / sub_path
+                full_target_path = (target_folder / sub_path).resolve()
+                if not full_target_path.is_relative_to(staging_root):
+                    raise ValueError(f"Unsafe path in upload: {relative_path}")
                 full_target_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # Write file
                 with open(full_target_path, 'wb') as f:
                     f.write(file_data)
 
+            if final_folder.exists():
+                shutil.rmtree(final_folder)
+            os.replace(target_folder, final_folder)
+
             logger.info(f"Successfully uploaded Live2D model folder: {safe_folder_name}")
-            return True, "Model folder uploaded successfully"
+            return True, "Model updated" if replace else "Model folder uploaded successfully"
 
         except Exception as e:
             logger.error(f"Error uploading Live2D model folder: {e}", exc_info=True)
@@ -166,8 +203,8 @@ class CharacterManager:
                 logger.warning(f"Live2D models directory does not exist: {self.live2d_path}")
                 return []
                 
-            for model_dir in self.live2d_path.iterdir():
-                if model_dir.is_dir():
+            for model_dir in sorted(self.live2d_path.iterdir(), key=lambda p: p.name.lower()):
+                if model_dir.is_dir() and not model_dir.name.startswith('.'):
                     # Look for .model3.json files
                     for file in model_dir.iterdir():
                         if file.suffix == '.json' and 'model3' in file.name:
@@ -181,7 +218,9 @@ class CharacterManager:
                                 display_name=display_name,
                                 model_type="live2d"
                             )
-                            models.append(model.to_dict())
+                            info = model.to_dict()
+                            info["missing"] = self._missing_live2d_files(file)
+                            models.append(info)
                             break
                             
             logger.info(f"Found {len(models)} Live2D models")
@@ -191,6 +230,17 @@ class CharacterManager:
             logger.error(f"Error getting Live2D models: {e}", exc_info=True)
             return []
     
+    @staticmethod
+    def _missing_live2d_files(model_file: Path) -> List[str]:
+        """Files referenced by a .model3.json that are not on disk (e.g. textures)."""
+        try:
+            import json
+            refs = json.loads(model_file.read_text(encoding="utf-8")).get("FileReferences", {})
+            paths = [refs.get("Moc")] + list(refs.get("Textures", []))
+            return [p for p in paths if p and not (model_file.parent / p).exists()]
+        except Exception:
+            return []
+
     def get_vrm_models(self) -> List[Dict[str, Any]]:
         """Get all available VRM models"""
         try:
@@ -200,7 +250,7 @@ class CharacterManager:
                 logger.warning(f"VRM models directory does not exist: {self.vrm_path}")
                 return []
                 
-            for file in self.vrm_path.iterdir():
+            for file in sorted(self.vrm_path.iterdir(), key=lambda p: p.name.lower()):
                 if file.is_file() and file.suffix.lower() == '.vrm':
                     # Create relative path for API serving
                     relative_path = f"/api/character/files/VRM3D/models/{file.name}"
@@ -268,7 +318,7 @@ class CharacterManager:
             base_abs = self.base_path.resolve()
             
             # Check if path is within our base directory
-            return str(path_abs).startswith(str(base_abs))
+            return path_abs.is_relative_to(base_abs)
         except Exception:
             return False
     

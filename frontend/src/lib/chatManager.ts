@@ -2,6 +2,7 @@ import { HistoryItem } from './types';
 import { pipelineManager } from './pipelineManager';
 import { cut5 } from './utils';
 import { createNewSession, updateSession, fetchSessionContent } from './sessionManager';
+import { readError, toastErrorOnce } from './api';
 
 type ChatUpdateCallback = (messages: HistoryItem[]) => void;
 
@@ -215,8 +216,10 @@ export class ChatManager {
             });
 
             if (!response.ok) {
-                const errorData = await response.json();
-                console.error("Error during completion:", errorData?.error);
+                const message = await readError(response);
+                console.error("Error during completion:", message);
+                toastErrorOnce(message, { label: "Open Brain", page: "brain" });
+                if (taskId !== null) pipelineManager.failTask(taskId);
                 return;
             }
 
@@ -229,7 +232,8 @@ export class ChatManager {
 
             await updateSession(this.sessionId, this.messages);
 
-            this.messages = [...this.messages, { role: 'user', content: input }];
+            // placeholder that the streamed reply fills in
+            this.messages = [...this.messages, { role: 'assistant', content: '' }];
             this.notifySubscribers('onMessagesChange');
 
             const reader = response.body?.getReader();
@@ -243,7 +247,8 @@ export class ChatManager {
                 const { done, value } = await reader.read();
                 if (done) break;
                 
-                const chunk = decoder.decode(value);
+                // stream: true keeps multi-byte characters intact across chunk boundaries
+                const chunk = decoder.decode(value, { stream: true });
                 aiMessage += chunk;
                 
                 this.messages = [...this.messages.slice(0, -1), { role: 'assistant', content: aiMessage }];
@@ -267,7 +272,7 @@ export class ChatManager {
                 }
             }
 
-            if (currentText.length > 0) {
+            if (currentText.trim().length > 0) {
                 if (taskId === null) {
                     taskId = pipelineManager.createTaskFromLLM(input, currentText);
                 } else {
@@ -275,7 +280,12 @@ export class ChatManager {
                 }
             }
 
-            if (taskId !== null) {
+            if (!aiMessage.trim()) {
+                // nothing came back: drop the empty bubble and release the pipeline
+                this.messages = this.messages.slice(0, -1);
+                toastErrorOnce("The model returned an empty reply. Check the Brain page for errors.", { label: "Open Brain", page: "brain" });
+                if (taskId !== null) pipelineManager.failTask(taskId);
+            } else if (taskId !== null) {
                 pipelineManager.markLLMFinished(taskId);
             }
             
@@ -287,6 +297,8 @@ export class ChatManager {
                 console.log('Fetch aborted');
             } else {
                 console.error('Fetch error:', error);
+                toastErrorOnce("Could not reach the app backend. Is it still running?");
+                if (taskId !== null) pipelineManager.failTask(taskId);
             }
         }
     }
@@ -300,6 +312,10 @@ export class ChatManager {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ history: history, systemPrompt: this.systemPrompt })
         });
+        if (!response.ok) {
+            toastErrorOnce(await readError(response), { label: "Open Brain", page: "brain" });
+            return;
+        }
         // get streaming response similar to sendMessage
         const reader = response.body?.getReader();
         const decoder = new TextDecoder();
@@ -310,7 +326,7 @@ export class ChatManager {
             const { done, value } = await reader.read();
             if (done) break;
             
-            const chunk = decoder.decode(value);
+            const chunk = decoder.decode(value, { stream: true });
             // add to the existing message
             this.messages[index].content += chunk;
             this.notifySubscribers('onMessagesChange');
@@ -379,7 +395,7 @@ export class ChatManager {
         });
 
         if (!response.ok) {
-            console.error("Error during regeneration");
+            toastErrorOnce(await readError(response), { label: "Open Brain", page: "brain" });
             return;
         }
 
@@ -392,7 +408,7 @@ export class ChatManager {
             const { done, value } = await reader.read();
             if (done) break;
             
-            const chunk = decoder.decode(value);
+            const chunk = decoder.decode(value, { stream: true });
             this.messages[index].content += chunk;
             this.notifySubscribers('onMessagesChange');
         }

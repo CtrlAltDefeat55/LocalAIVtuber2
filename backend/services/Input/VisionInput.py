@@ -25,26 +25,43 @@ class VisionInput:
         """
         self.device = device
         self.logger = logger
-        
-        # Initialize OCR reader
-        try:
-            self.ocr_reader = easyocr.Reader(languages)
-            self.logger.info(f"OCR reader initialized with languages: {languages}")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize OCR reader: {e}")
-            self.ocr_reader = None
-        
-        # Initialize image captioning model
-        try:
-            self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-            self.model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-            if device == 'cuda' and torch.cuda.is_available():
-                self.model = self.model.to('cuda')
-            self.logger.info("Image captioning model initialized")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize image captioning model: {e}")
-            self.processor = None
-            self.model = None
+        self.languages = languages
+        # OCR and captioning models load on first screenshot, not at app start.
+        self._ocr_reader = None
+        self._caption_models = None
+
+    @property
+    def ocr_reader(self):
+        if self._ocr_reader is None:
+            try:
+                self._ocr_reader = easyocr.Reader(self.languages)
+                self.logger.info(f"OCR reader initialized with languages: {self.languages}")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize OCR reader: {e}")
+                self._ocr_reader = False
+        return self._ocr_reader or None
+
+    def _captioning(self):
+        if self._caption_models is None:
+            try:
+                processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+                model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+                if self.device == 'cuda' and torch.cuda.is_available():
+                    model = model.to('cuda')
+                self._caption_models = (processor, model)
+                self.logger.info("Image captioning model initialized")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize image captioning model: {e}")
+                self._caption_models = (None, None)
+        return self._caption_models
+
+    @property
+    def processor(self):
+        return self._captioning()[0]
+
+    @property
+    def model(self):
+        return self._captioning()[1]
 
     def get_monitors(self) -> List[Dict]:
         """

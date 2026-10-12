@@ -1,89 +1,91 @@
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+# Must run before any library that reads cache locations is imported.
+from services.lib.paths import (APP_ROOT, BACKEND_DIR, FRONTEND_DIST, LLM_MODELS_DIR, SETTINGS_FILE, VOICES_DIR,
+                                configure_environment, hf_token, save_hf_token)
+configure_environment()
 
 import time
 from services.lib.startup_progress import startup_progress
-# Track import time
 start_time = time.time()
 total_start_time = time.time()
 startup_progress.show_step("Importing python modules")
 
 import asyncio
+import json
+import subprocess
+import threading
 import traceback
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import uvicorn
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from services.Character.characterManager import CharacterManager
 from services.ChatFetch.Chatfetch import ChatFetch
 from services.Input.Input import VoiceInput
 from services.Input.VisionInput import VisionInput
-from services.TTS.TTS import TTS
-from services.Memory.Memory import Memory
+from services.LLM.LLM import LLM
+from services.LLM.routes import create_router as create_llm_router
 from services.Memory.HistoryStore import HistoryStore
-from services.Character.characterManager import CharacterManager
+from services.Memory.Memory import Memory
+from services.TTS.TTS import TTS
+from services.TTS.routes import create_router as create_tts_router
 from services.lib.LAV_logger import logger
 from services.lib.port_forward import create_proxy_middleware
 from services.lib.process_manager import process_manager
-import os
-import aiofiles
-import aiohttp
-from fastapi import FastAPI, Request, Response, WebSocket, HTTPException, File, UploadFile, Form
-from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-import uvicorn
-from services.LLM.LLM import LLM
-from pydantic import BaseModel
-from datetime import datetime
-import json
-from typing import Any, Dict, List
-import mss
-import traceback
-import threading
-import queue
 
-# Download progress tracking
-download_progress = {}
+APP_VERSION = "3.0.0"
+HOST, PORT = "127.0.0.1", int(os.environ.get("LAV_PORT", "8000"))
 
-# Show import completion immediately after imports
-import_time = time.time() - start_time
-startup_progress.complete_step(f"Imports completed in {import_time:.2f}s")
+startup_progress.complete_step(f"Imports completed in {time.time() - start_time:.2f}s")
 
-# Initialize RVC server
-rvc_server_port = 8001  # Different port from main server
+# *******************************
+# RVC plugin (optional, Windows release package only)
+# *******************************
 
-# Start RVC server during initialization
-rvc_dir = os.path.join(os.path.dirname(__file__), "plugins", "rvc")
-rvc_runtime_python = os.path.join(rvc_dir, "runtime", "python.exe")
-rvc_server_script = os.path.join(rvc_dir, "rvc_server.py")
+rvc_server_port = 8001
+rvc_dir = BACKEND_DIR / "plugins" / "rvc"
+rvc_runtime_python = rvc_dir / "runtime" / ("python.exe" if sys.platform == "win32" else "bin/python")
 
-success, message = process_manager.start_server_process(
-    name="RVC",
-    python_path=rvc_runtime_python,
-    script_path=rvc_server_script,
-    port=rvc_server_port,
-    cwd=rvc_dir
-)
 
-if not success:
-    logger.error(f"Failed to start RVC server: {message}")
+def start_rvc():
+    if not rvc_runtime_python.exists():
+        logger.info("RVC plugin runtime not installed; RVC voice conversion is unavailable.")
+        return
+    ok, message = process_manager.start_server_process(
+        name="RVC", python_path=str(rvc_runtime_python), script_path=str(rvc_dir / "rvc_server.py"),
+        port=rvc_server_port, cwd=str(rvc_dir))
+    if not ok:
+        logger.error(f"Failed to start RVC server: {message}")
 
-app = FastAPI()
-static_files_path = os.path.abspath("../frontend/dist")
-app.mount("/assets", StaticFiles(directory="../frontend/dist/assets"), name="assets")
-app.mount("/resource", StaticFiles(directory="../frontend/dist/resource"), name="resource")
 
-# Initialize Services
+app = FastAPI(title="Local AI Vtuber", version=APP_VERSION)
+if (FRONTEND_DIST / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+    app.mount("/resource", StaticFiles(directory=FRONTEND_DIST / "resource"), name="resource")
+
+# Initialize Services (heavy models inside them load lazily on first use)
 start_time = time.time()
 startup_progress.show_step("Loading AI Services")
-voice_input:VoiceInput = VoiceInput()
-llm:LLM = LLM()
-memory:Memory = Memory()
-history_store:HistoryStore = HistoryStore()
-tts:TTS = TTS()
-vision_input:VisionInput = VisionInput()
-character_manager:CharacterManager = CharacterManager()
+voice_input: VoiceInput = VoiceInput()
+llm: LLM = LLM()
+memory: Memory = Memory()
+history_store: HistoryStore = HistoryStore()
+tts: TTS = TTS()
+vision_input: VisionInput = VisionInput()
+character_manager: CharacterManager = CharacterManager()
 startup_progress.complete_step(f"AI Services loaded in {time.time() - start_time:.2f}s")
 
 clients = set()
-
-# Initialize ChatFetch service
 chat_fetch = ChatFetch()
 chat_clients = set()
 
@@ -93,7 +95,20 @@ chat_clients = set()
 
 @app.get("/")
 async def serve_webui():
-    return FileResponse("../frontend/dist/index.html")
+    index = FRONTEND_DIST / "index.html"
+    if not index.exists():
+        return JSONResponse(status_code=503, content={
+            "error": "The web interface is not built. Run the start script again, or `npm run build` in frontend/."})
+    return FileResponse(index)
+
+
+@app.get("/{icon_name}")
+async def serve_root_file(icon_name: str):
+    """Root-level static files from the build (favicon, app icon, manifest)."""
+    path = (FRONTEND_DIST / icon_name).resolve()
+    if path.parent == FRONTEND_DIST.resolve() and path.is_file():
+        return FileResponse(path)
+    raise HTTPException(status_code=404)
 
 # *******************************
 # Input
@@ -101,7 +116,14 @@ async def serve_webui():
 
 @app.post("/api/record/start")
 async def start_recording():
-    asyncio.create_task(voice_input.start_streaming(clients))
+    async def run():
+        try:
+            await voice_input.start_streaming(clients)
+        except Exception as e:
+            logger.error(f"Microphone input failed: {e}")
+            await asyncio.gather(*[c.send_json({"type": "error", "message": f"Microphone failed: {e}"})
+                                   for c in list(clients)], return_exceptions=True)
+    asyncio.create_task(run())
     return Response(status_code=200)
 
 @app.post("/api/record/stop")
@@ -305,365 +327,41 @@ class CompleteResponseRequest(BaseModel):
     history: list
     systemPrompt: str = ""
 
+
+async def _stream_llm(make_generator, fastapi_request: Request):
+    """Load the model if needed, then stream; errors before the first token become a JSON error."""
+    try:
+        await llm.ensure_loaded()
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+    generator = make_generator()
+
+    async def stream_response():
+        try:
+            async for chunk in generator:
+                if await fastapi_request.is_disconnected():
+                    logger.info("Client disconnected, stopping response stream.")
+                    break
+                yield chunk
+        except Exception as e:
+            logger.error(f"Error during completion: {e}")
+        finally:
+            await generator.aclose()
+
+    return StreamingResponse(stream_response(), media_type="text/plain")
+
+
 @app.post("/api/completion")
 async def get_completion(request: LLMRequest, fastapi_request: Request):
-    try:
-        response = llm.get_completion(request.text, request.history, request.systemPrompt, request.screenshot)
-        if response is None:
-            return {"error": "No response from LLM service"}
-        
-        async def stream_response():
-            try:
-                # Wrap the generator in an asynchronous generator
-                async for chunk in async_generator_wrapper(response):
-                    # Check if the client has disconnected
-                    if await fastapi_request.is_disconnected():
-                        logger.info("Client disconnected, stopping response stream.")
-                        break
-                    yield chunk
-            finally:
-                pass
-                # llm.unload_model()  # Ensure the model is unloaded when the stream ends or is interrupted
+    return await _stream_llm(lambda: llm.get_completion(request.text, request.history, request.systemPrompt,
+                                                        request.screenshot), fastapi_request)
 
-        return StreamingResponse(stream_response(), media_type="text/plain")
-    except Exception as e:
-        logger.error(f"Error during completion: {e}", exc_info=True)
-        return {"error": "Internal server error"}
 
 @app.post("/api/completion/complete")
 async def complete_current_response(request: CompleteResponseRequest, fastapi_request: Request):
-    try:
-        if not llm.llm:
-            llm.load_model(llm.current_model_data)
-            
-        response = llm.complete_current_response(request.history, request.systemPrompt)
-        if response is None:
-            return {"error": "No response from LLM service"}
-        
-        async def stream_response():
-            try:
-                async for chunk in async_generator_wrapper(response):
-                    if await fastapi_request.is_disconnected():
-                        logger.info("Client disconnected, stopping response stream.")
-                        break
-                    yield chunk
-            finally:
-                pass
+    return await _stream_llm(lambda: llm.complete_current_response(request.history, request.systemPrompt),
+                             fastapi_request)
 
-        return StreamingResponse(stream_response(), media_type="text/plain")
-    except Exception as e:
-        logger.error(f"Error during completion: {e}", exc_info=True)
-        return {"error": "Internal server error"}
-
-# Utility function to wrap a regular generator as an async generator
-async def async_generator_wrapper(generator):
-    for item in generator:
-        yield item
-
-@app.get("/api/llm/models")
-async def get_llm_models():
-    llm._load_available_models()
-    return JSONResponse(content={"models": llm.all_model_data, "currentModel": llm.current_model_data})
-
-# *******************************
-# Model Download
-# *******************************
-
-class DownloadModelRequest(BaseModel):
-    model_id: str  # This could be displayName or fileName
-
-@app.post("/api/llm/models/download")
-async def download_model(request: DownloadModelRequest):
-    """Download a model to the appropriate folder"""
-    try:
-        # Find the model in the available models
-        target_model = None
-        for model in llm.all_model_data:
-            if (model.get('displayName') == request.model_id or 
-                model.get('fileName') == request.model_id):
-                target_model = model
-                break
-        
-        if not target_model:
-            return JSONResponse(status_code=404, content={"error": "Model not found"})
-        
-        model_name = target_model.get('fileName')
-        download_url = target_model.get('link')
-        
-        if not download_url:
-            return JSONResponse(status_code=400, content={"error": "No download URL available for this model"})
-        
-        # Determine the target folder and file path
-        if 'model_folder' in target_model:
-            target_folder = target_model['model_folder']
-        else:
-            # Create folder based on model name (without extension)
-            folder_name = os.path.splitext(model_name)[0]
-            target_folder = os.path.join(llm.models_directory, folder_name)
-        
-        # Create the folder if it doesn't exist
-        os.makedirs(target_folder, exist_ok=True)
-        
-        target_file_path = os.path.join(target_folder, model_name)
-        
-        # Check if file already exists
-        if os.path.exists(target_file_path):
-            return JSONResponse(status_code=409, content={
-                "error": "Model already exists", 
-                "message": "Delete the model first before downloading again"
-            })
-        
-        # Start the download in the background
-        download_id = f"{model_name}_{int(time.time())}"
-        download_progress[download_id] = {
-            'model_name': model_name,
-            'status': 'starting',
-            'progress': 0,
-            'total_size': 0,
-            'downloaded_size': 0,
-            'error': None,
-            'start_time': time.time()
-        }
-        
-        # Start background download task
-        asyncio.create_task(download_model_file(download_id, download_url, target_file_path))
-        
-        return JSONResponse(content={
-            "message": "Download started",
-            "download_id": download_id,
-            "target_path": target_file_path
-        })
-        
-    except Exception as e:
-        logger.error(f"Error starting model download: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": "Failed to start download"})
-
-async def download_model_file(download_id: str, url: str, target_path: str):
-    """Download a model file with progress tracking"""
-    try:
-        download_progress[download_id]['status'] = 'downloading'
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    raise Exception(f"HTTP {response.status}: {await response.text()}")
-                
-                total_size = int(response.headers.get('Content-Length', 0))
-                download_progress[download_id]['total_size'] = total_size
-                
-                downloaded_size = 0
-                
-                # Create a temporary file first
-                temp_path = target_path + '.tmp'
-                
-                async with aiofiles.open(temp_path, 'wb') as file:
-                    async for chunk in response.content.iter_chunked(8192):
-                        await file.write(chunk)
-                        downloaded_size += len(chunk)
-                        
-                        # Update progress
-                        progress = (downloaded_size / total_size * 100) if total_size > 0 else 0
-                        download_progress[download_id].update({
-                            'progress': progress,
-                            'downloaded_size': downloaded_size
-                        })
-                
-                # Move temp file to final location
-                if os.path.exists(target_path):
-                    os.remove(target_path)
-                os.rename(temp_path, target_path)
-                
-                # Mark as completed
-                download_progress[download_id]['status'] = 'completed'
-                download_progress[download_id]['progress'] = 100
-                
-                logger.info(f"Model download completed: {target_path}")
-                
-                # Refresh model list to update file existence status
-                llm._load_available_models()
-                
-    except Exception as e:
-        logger.error(f"Model download failed for {download_id}: {e}")
-        download_progress[download_id]['status'] = 'error'
-        download_progress[download_id]['error'] = str(e)
-        
-        # Clean up temp file if it exists
-        temp_path = target_path + '.tmp'
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-@app.get("/api/llm/models/download/{download_id}/progress")
-async def get_download_progress(download_id: str):
-    """Get the progress of a model download"""
-    if download_id not in download_progress:
-        return JSONResponse(status_code=404, content={"error": "Download ID not found"})
-    
-    progress_info = download_progress[download_id].copy()
-    
-    # Add elapsed time
-    progress_info['elapsed_time'] = time.time() - progress_info['start_time']
-    
-    # Calculate download speed if downloading
-    if progress_info['status'] == 'downloading' and progress_info['elapsed_time'] > 0:
-        speed = progress_info['downloaded_size'] / progress_info['elapsed_time']
-        progress_info['download_speed'] = f"{llm._format_file_size(speed)}/s"
-    
-    return JSONResponse(content=progress_info)
-
-@app.delete("/api/llm/models/download/{download_id}")
-async def cancel_download(download_id: str):
-    """Cancel a model download"""
-    if download_id not in download_progress:
-        return JSONResponse(status_code=404, content={"error": "Download ID not found"})
-    
-    if download_progress[download_id]['status'] in ['completed', 'error']:
-        return JSONResponse(status_code=400, content={"error": "Download cannot be cancelled"})
-    
-    download_progress[download_id]['status'] = 'cancelled'
-    return JSONResponse(content={"message": "Download cancelled"})
-
-@app.get("/api/llm/models/downloads")
-async def get_all_downloads():
-    """Get status of all downloads"""
-    return JSONResponse(content={"downloads": download_progress})
-
-class DeleteModelRequest(BaseModel):
-    model_id: str  # This could be displayName or fileName
-
-@app.delete("/api/llm/models/delete")
-async def delete_model(request: DeleteModelRequest):
-    """Delete a downloaded model file"""
-    try:
-        # Find the model in the available models
-        target_model = None
-        for model in llm.all_model_data:
-            if (model.get('displayName') == request.model_id or 
-                model.get('fileName') == request.model_id):
-                target_model = model
-                break
-        
-        if not target_model:
-            return JSONResponse(status_code=404, content={"error": "Model not found"})
-        
-        model_name = target_model.get('fileName')
-        
-        # Determine the model file path
-        if 'model_folder' in target_model:
-            target_folder = target_model['model_folder']
-        else:
-            # Fallback to old method
-            folder_name = os.path.splitext(model_name)[0]
-            target_folder = os.path.join(llm.models_directory, folder_name)
-        
-        target_file_path = os.path.join(target_folder, model_name)
-        
-        # Check if file exists
-        if not os.path.exists(target_file_path):
-            return JSONResponse(status_code=404, content={"error": "Model file not found"})
-        
-        # Check if this is the currently loaded model
-        if llm.current_model_data and llm.current_model_data.get('fileName') == model_name:
-            if llm.llm:
-                llm.unload_model()
-        
-        # Delete the model file
-        os.remove(target_file_path)
-        logger.info(f"Deleted model file: {target_file_path}")
-        
-        # For vision models, also delete mmproj file if it exists
-        if target_model.get('type') == 'vision':
-            mmproj_path = target_model.get('mmproj_path')
-            if mmproj_path:
-                full_mmproj_path = os.path.join(target_folder, mmproj_path)
-                if os.path.exists(full_mmproj_path):
-                    os.remove(full_mmproj_path)
-                    logger.info(f"Deleted mmproj file: {full_mmproj_path}")
-        
-        # Refresh model list to update file existence status
-        llm._load_available_models()
-        
-        return JSONResponse(content={
-            "message": "Model deleted successfully",
-            "deleted_file": target_file_path
-        })
-        
-    except Exception as e:
-        logger.error(f"Error deleting model: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": "Failed to delete model"})
-
-# *******************************
-# TTS
-# *******************************
-
-class TTSRequest(BaseModel):
-    text: str
-
-class ChangeVoiceRequest(BaseModel):
-    voice_name: str
-
-class DeleteVoiceRequest(BaseModel):
-    name: str
-
-@app.get("/api/tts/voices")
-async def get_available_voices():
-    try:
-        voices = tts.get_available_voices()
-        return JSONResponse(content={
-            "voices": voices,
-            "current_voice": tts.current_voice
-        })
-    except Exception as e:
-        logger.error(f"Error getting voices: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": "Failed to get available voices"})
-
-@app.post("/api/tts/change-voice")
-async def change_voice(request: ChangeVoiceRequest):
-    try:
-        result = tts.change_voice(request.voice_name)
-        settings_manager.update_settings({"tts.voice": request.voice_name})
-        return JSONResponse(content=result)
-    except ValueError as ve:
-        return JSONResponse(status_code=400, content={"error": str(ve)})
-    except Exception as e:
-        logger.error(f"Error changing voice: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": "Failed to change voice"})
-
-@app.post("/api/tts")
-async def get_audio(request: TTSRequest):
-    response = tts.synthesize(request.text)
-    return Response(response, media_type="audio/wav")
-
-@app.post("/api/tts/upload")
-async def upload_voice(
-    name: str = Form(...),
-    reference_text: str = Form(...),
-    reference_language: str = Form(...),
-    reference_audio: UploadFile = File(...)
-):
-    try:
-        # Read the file content
-        audio_data = await reference_audio.read()
-        
-        result = tts.upload_voice(
-            name=name,
-            reference_audio=audio_data,
-            reference_text=reference_text,
-            reference_language=reference_language
-        )
-        return JSONResponse(content=result)
-    except Exception as e:
-        logger.error(f"Error uploading voice: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": f"Failed to upload voice: {str(e)}"})
-    
-@app.delete("/api/tts/delete")
-async def delete_voice(request: DeleteVoiceRequest):
-    try:
-        result = tts.delete_voice(request.name)
-        return JSONResponse(content=result)
-    except Exception as e:
-        logger.error(f"Error deleting voice: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": "Failed to delete voice"})
-    
 # *******************************
 # Character Models
 # *******************************
@@ -710,14 +408,11 @@ async def serve_character_files(file_path: str, request: Request):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/character/vrm/upload")
-async def upload_vrm_model(file: UploadFile = File(...)):
-    """Upload a VRM model file"""
+async def upload_vrm_model(file: UploadFile = File(...), replace: bool = Form(False), target_name: str = Form("")):
+    """Upload (or with replace=true, update) a VRM model file; target_name keeps the existing file name"""
     try:
-        # Read file content
         file_data = await file.read()
-        
-        # Upload using character manager
-        success, message = character_manager.upload_vrm_model(file_data, file.filename)
+        success, message = character_manager.upload_vrm_model(file_data, target_name or file.filename, replace=replace)
         
         if success:
             return JSONResponse(status_code=200, content={"message": message})
@@ -728,8 +423,21 @@ async def upload_vrm_model(file: UploadFile = File(...)):
         logger.error(f"Error uploading VRM model: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Failed to upload model"})
 
+@app.post("/api/character/live2d/upload-zip")
+async def upload_live2d_zip(file: UploadFile = File(...), replace: bool = Form(False), target_name: str = Form("")):
+    """Install a Live2D model from a .zip archive (target_name replaces that existing model)"""
+    try:
+        success, message = character_manager.upload_live2d_zip(await file.read(), file.filename, replace=replace,
+                                                               target_name=target_name)
+        return JSONResponse(status_code=200 if success else 400,
+                            content={"message": message} if success else {"error": message})
+    except Exception as e:
+        logger.error(f"Error uploading Live2D zip: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "Failed to install model"})
+
 @app.post("/api/character/live2d/upload-folder")
-async def upload_live2d_folder(files: List[UploadFile] = File(...)):
+async def upload_live2d_folder(files: List[UploadFile] = File(...), replace: bool = Form(False),
+                               target_name: str = Form("")):
     """Upload a Live2D model folder"""
     try:
         # Read all files and their relative paths
@@ -738,8 +446,7 @@ async def upload_live2d_folder(files: List[UploadFile] = File(...)):
             content = await file.read()
             file_data.append((file.filename, content))
         
-        # Upload using character manager
-        success, message = character_manager.upload_live2d_folder(file_data)
+        success, message = character_manager.upload_live2d_folder(file_data, replace=replace, target_name=target_name)
         
         if success:
             return JSONResponse(status_code=200, content={"message": message})
@@ -750,11 +457,11 @@ async def upload_live2d_folder(files: List[UploadFile] = File(...)):
         logger.error(f"Error uploading Live2D model folder: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Failed to upload model folder"})
 
-class DeleteModelRequest(BaseModel):
+class DeleteCharacterRequest(BaseModel):
     path: str
 
 @app.post("/api/character/vrm/delete")
-async def delete_vrm_model(request: DeleteModelRequest):
+async def delete_vrm_model(request: DeleteCharacterRequest):
     """Delete a VRM model"""
     try:
         success, message = character_manager.delete_vrm_model(request.path)
@@ -769,7 +476,7 @@ async def delete_vrm_model(request: DeleteModelRequest):
         return JSONResponse(status_code=500, content={"error": "Failed to delete model"})
 
 @app.post("/api/character/live2d/delete")
-async def delete_live2d_model(request: DeleteModelRequest):
+async def delete_live2d_model(request: DeleteCharacterRequest):
     """Delete a Live2D model folder"""
     try:
         success, message = character_manager.delete_live2d_model(request.path)
@@ -783,98 +490,110 @@ async def delete_live2d_model(request: DeleteModelRequest):
         logger.error(f"Error deleting Live2D model: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Failed to delete model"})
 
+
 # *******************************
 # Settings
 # *******************************
 
+SAMPLING_KEYS = {"top_k": int, "top_p": float, "min_p": float, "repeat_penalty": float, "temperature": float,
+                 "seed": int}
+RUNTIME_KEYS = {"llm.context_size": ("context_size", int), "llm.gpu_layers": ("gpu_layers", str),
+                "load-llm-cpu": ("cpu_only", bool), "llm.enable_vision": ("enable_vision", bool),
+                "llm.thinking": ("thinking", bool), "llm.max_tokens": ("max_tokens", int)}
+
+
 class SettingsManager:
-    def __init__(self, settings_file: str):
-        self.settings_file = settings_file
+    def __init__(self, settings_file):
+        self.settings_file = str(settings_file)
         self.settings = self.load_settings()
+        self._lock = threading.Lock()
 
     def load_settings(self) -> Dict[str, Any]:
-        if not os.path.exists(self.settings_file):
+        try:
+            with open(self.settings_file, "r", encoding="utf-8") as file:
+                return json.load(file)
+        except FileNotFoundError:
             return {}
-        with open(self.settings_file, "r") as file:
-            return json.load(file)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"settings.json is unreadable ({e}); starting with defaults")
+            return {}
 
     def save_settings(self, settings: Dict[str, Any]):
-        with open(self.settings_file, "w") as file:
-            json.dump(settings, file, indent=4)
+        tmp = self.settings_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as file:
+            json.dump(settings, file, indent=4, ensure_ascii=False)
+        os.replace(tmp, self.settings_file)  # atomic: a crash never leaves a half-written file
 
-    def apply_settings(self):
-        # Create a copy of items to avoid modification during iteration
-        settings_items = list(self.settings.items())
-        
-        for key, value in settings_items:
-            if key == "llm.model_filename":
-                llm.load_model_by_filename(value)
-        
-        for key, value in settings_items:
-            if key == "llm.keep_model_loaded":
-                llm.set_keep_model_loaded(value)
-            if key == "stream.yt.videoid":
-                chat_fetch.video_id = value
-            if key == "tts.voice":
+    def apply_settings(self, keys=None):
+        """Apply settings to the services. Only `keys` are applied when given (all on startup)."""
+        s = self.settings
+        keys = set(s.keys()) if keys is None else set(keys)
+
+        runtime = {}
+        for key, (option, cast) in RUNTIME_KEYS.items():
+            if key in keys and key in s:
                 try:
-                    tts.change_voice(value)
-                except ValueError:
-                    # If saved voice is not available, remove it from settings
-                    logger.warning(f"Saved voice '{value}' not found, removing from settings")
-                    self.settings.pop("tts.voice")
-                    self.save_settings(self.settings)
-        
-        # Apply LLM sampling parameters
-        llm_sampling_params = {}
-        for key, value in settings_items:
-            if key.startswith("llm.") and key.split(".", 1)[1] in ["top_k", "top_p", "min_p", "repeat_penalty", "temperature", "seed"]:
-                param_name = key.split(".", 1)[1]
+                    runtime[option] = cast(s[key]) if cast is not str else str(s[key] or "auto")
+                except (TypeError, ValueError):
+                    logger.warning(f"Invalid value for {key}: {s[key]!r}")
+        if runtime:
+            llm.set_runtime_options(**runtime)
+
+        sampling = {}
+        for name, cast in SAMPLING_KEYS.items():
+            key = f"llm.{name}"
+            if key in keys and key in s:
                 try:
-                    # Convert to appropriate type
-                    if param_name == "seed":
-                        llm_sampling_params[param_name] = int(value)
-                    elif param_name in ["top_k"]:
-                        llm_sampling_params[param_name] = int(value)
-                    else:
-                        llm_sampling_params[param_name] = float(value)
-                except (ValueError, TypeError):
-                    logger.warning(f"Invalid value for {key}: {value}, using default")
-        
-        if llm_sampling_params:
-            llm.update_sampling_params(llm_sampling_params)
+                    sampling[name] = cast(s[key])
+                except (TypeError, ValueError):
+                    logger.warning(f"Invalid value for {key}: {s[key]!r}, using default")
+        if sampling:
+            llm.update_sampling_params(sampling)
+
+        if "llm.keep_model_loaded" in keys and "llm.keep_model_loaded" in s:
+            llm.keep_model_loaded = bool(s["llm.keep_model_loaded"])
+        model_key = "llm.model_id" if "llm.model_id" in s else "llm.model_filename"
+        if model_key in keys and s.get(model_key):
+            llm.select_model(s[model_key], load=False)
+
+        if "stream.yt.videoid" in keys and "stream.yt.videoid" in s:
+            chat_fetch.video_id = s["stream.yt.videoid"]
+        if "tts.speed" in keys and "tts.speed" in s:
+            tts.options["speed"] = float(s["tts.speed"])
+        for engine_id in ("tada",):
+            if f"tts.{engine_id}.variant" in s:
+                tts.variants[engine_id] = s[f"tts.{engine_id}.variant"]
+        if "tts.engine" in keys and s.get("tts.engine"):
+            try:
+                tts.set_engine(s["tts.engine"], start=False)
+            except ValueError:
+                logger.warning(f"Unknown voice engine in settings: {s['tts.engine']}")
+        if "tts.voice" in keys and s.get("tts.voice"):
+            try:
+                tts.change_voice(s["tts.voice"])
+            except ValueError:
+                logger.warning(f"Saved voice '{s['tts.voice']}' not found, keeping {tts.current_voice}")
 
     def update_settings(self, updated_settings: Dict[str, Any]):
-        self.settings.update(updated_settings)
-        self.save_settings(self.settings)
-        self.apply_settings()
+        with self._lock:
+            self.settings.update(updated_settings)
+            self.save_settings(self.settings)
+        self.apply_settings(updated_settings.keys())
+        # selecting a model from the Brain page should also load it when "keep loaded" is on
+        if {"llm.model_id", "llm.model_filename"} & updated_settings.keys() and llm.keep_model_loaded:
+            if (llm.current_model_data or {}).get("file_exists"):
+                llm.load_in_background()
 
-# Initialize the SettingsManager
-SETTINGS_FILE = "settings.json"
+
 settings_manager = SettingsManager(SETTINGS_FILE)
-
-# Apply settings on startup
 start_time = time.time()
 startup_progress.show_step("Applying Settings")
 settings_manager.apply_settings()
 startup_progress.complete_step(f"Settings applied in {time.time() - start_time:.2f}s")
 
-# Warm up TTS to reduce first request latency
-start_time = time.time()
-startup_progress.show_step("Warming up TTS")
-try:
-    tts.synthesize("Hi")
-    startup_progress.complete_step(f"TTS warmed up successfully in {time.time() - start_time:.2f}s")
-except Exception as e:
-    startup_progress.complete_step(f"TTS warm-up failed (non-critical) in {time.time() - start_time:.2f}s")
-    logger.warning(f"TTS warm-up failed (non-critical): {e}")
+app.include_router(create_llm_router(llm))
+app.include_router(create_tts_router(tts, lambda values: settings_manager.update_settings(values)))
 
-# Log startup time
-startup_time = time.time() - total_start_time
-startup_progress.complete_step(f"✅ Server Ready in {startup_time:.2f}s at {datetime.now().strftime('%H:%M:%S')}")
-
-# *******************************
-# Settings API
-# *******************************
 
 class UpdateSettingsRequest(BaseModel):
     settings: Dict[str, Any]
@@ -893,9 +612,109 @@ async def update_settings(request: UpdateSettingsRequest):
 
 @app.get("/api/settings")
 async def get_settings():
-    return JSONResponse(content={
-        "settings": settings_manager.settings
-    })
+    return JSONResponse(content={"settings": settings_manager.settings})
+
+
+class TokenRequest(BaseModel):
+    token: Optional[str] = None
+
+@app.get("/api/settings/hf-token")
+async def get_hf_token():
+    token = hf_token()
+    return {"has_token": bool(token), "hint": f"hf_...{token[-4:]}" if token else None}
+
+@app.post("/api/settings/hf-token")
+async def set_hf_token(request: TokenRequest):
+    token = (request.token or "").strip()
+    if token and not token.startswith("hf_"):
+        return JSONResponse(status_code=400, content={"error": "Hugging Face tokens start with 'hf_'"})
+    save_hf_token(token or None)
+    return await get_hf_token()
+
+# *******************************
+# System: status, folders, quit
+# *******************************
+
+uvicorn_server: Optional[uvicorn.Server] = None
+
+@app.get("/api/system/status")
+async def system_status():
+    return {
+        "version": APP_VERSION,
+        "llm": llm.status(),
+        "tts": {"active_engine": tts.active_engine, "current_voice": tts.current_voice,
+                "state": tts.engines.engine_state(tts.active_engine),
+                "error": tts.engines.errors.get(tts.active_engine)},
+        "gpu": {k: v for k, v in tts.gpu.items() if k != "index"},
+        "platform": sys.platform,
+    }
+
+FOLDERS = {
+    "models": LLM_MODELS_DIR,
+    "voices": VOICES_DIR,
+    "live2d": character_manager.live2d_path,
+    "vrm": character_manager.vrm_path,
+    "app": APP_ROOT,
+}
+
+class FolderRequest(BaseModel):
+    which: str
+
+@app.post("/api/system/open-folder")
+async def open_folder(request: FolderRequest):
+    folder = FOLDERS.get(request.which)
+    if not folder:
+        return JSONResponse(status_code=404, content={"error": "Unknown folder"})
+    os.makedirs(folder, exist_ok=True)
+    try:
+        if sys.platform == "win32":
+            os.startfile(folder)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Could not open folder: {e}", "path": str(folder)})
+    return {"path": str(folder)}
+
+@app.post("/api/system/shutdown")
+async def shutdown():
+    """Quit the whole app: stops the model, voice engines and this server."""
+    logger.info("Shutdown requested from the app")
+
+    async def stop_soon():
+        await asyncio.sleep(0.3)  # let this response reach the browser
+        voice_input.stop_streaming()
+        chat_fetch.stop_fetching()
+        await asyncio.to_thread(process_manager.stop_all_servers)
+        if uvicorn_server:
+            uvicorn_server.should_exit = True
+        else:
+            os._exit(0)
+
+    asyncio.create_task(stop_soon())
+    return {"message": "Shutting down"}
+
+
+async def warm_up():
+    """Load the model and voice in the background so the UI is usable immediately."""
+    threading.Thread(target=start_rvc, daemon=True).start()
+    if llm.keep_model_loaded and (llm.current_model_data or {}).get("file_exists"):
+        llm.load_in_background()
+    if tts.engines.is_installed(tts.active_engine):
+        tts.start_in_background()
+    startup_progress.complete_step(
+        f"Server ready in {time.time() - total_start_time:.2f}s at {datetime.now().strftime('%H:%M:%S')} "
+        f"- open http://{HOST}:{PORT}")
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    await warm_up()
+    yield
+    await asyncio.to_thread(process_manager.stop_all_servers)
+
+app.router.lifespan_context = lifespan
 
 # *******************************
 # Chat History API
@@ -1149,9 +968,9 @@ async def query_memory_context(request: QueryContextRequest):
 app.middleware("http")(create_proxy_middleware("/api/rvc", rvc_server_port))
 
 if __name__ == "__main__":
+    config = uvicorn.Config(app, host=HOST, port=PORT, log_level="warning")
+    uvicorn_server = uvicorn.Server(config)
     try:
-        uvicorn.run(app, host="localhost", port=8000)
+        uvicorn_server.run()
     finally:
-        # Stop all managed processes on shutdown
         process_manager.stop_all_servers()
-

@@ -1,12 +1,9 @@
 import { CharacterRender } from "@/components/character-render"
 
-
-
 function CharacterPage() {
     return (
-        <div className="w-fill h-fill">
-
-            <CharacterRender/>
+        <div className="h-full w-full">
+            <CharacterRender />
         </div>
     )
 }

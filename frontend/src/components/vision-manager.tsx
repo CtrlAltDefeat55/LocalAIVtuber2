@@ -169,7 +169,7 @@ export function VisionManager({ className }: VisionManagerProps) {
   const scaledResolution = getScaledResolution();
 
   return (
-    <div className="relative overflow-hidden h-screen ">
+    <div className="relative overflow-hidden h-full">
       <SidePanel isOpen={true} width={400}>
         {/* Monitor Selection */}
         <div className="flex flex-col gap-2">

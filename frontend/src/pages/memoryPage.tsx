@@ -2,7 +2,9 @@ import SessionList from "@/components/session-list"
 
 function MemoryPage() {
     return (
-        <SessionList />
+        <div className="h-full overflow-y-auto">
+            <SessionList />
+        </div>
     )
 }
 

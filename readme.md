@@ -1,16 +1,13 @@
-# Local AI Vtuber 2 (Fully local AI vtuber that can see your screen and talk in real time)
+# Local AI VTuber
 
-Full demo and setup guide: https://youtu.be/gD1y4by3CPg?si=oinKcReuUd5xzjKT
+A fully local AI VTuber that talks in real time, can see your screen, and runs entirely on your computer.
 
-- All AI models run locally.
-- Can chat about what's on your screen.
-- Can be interrupted mid-sentence.
-- Modern web UI with 2D and 3D character rendering.
-- Custom finetuned language model for more interesting conversations.
-- Long term memory storage and retrieval.
-- Can edit conversations and export as training data.
+- **Brain:** modern open models such as **Qwen3.8 27B (abliterated, IQ3_S)** and **Gemma 4 12B**, running on [llama.cpp](https://github.com/ggml-org/llama.cpp) with NVIDIA, AMD/Intel (Vulkan), Apple Silicon (Metal) or CPU.
+- **Voice:** one-click voice engines (**Chatterbox Turbo**, **LuxTTS**, **OmniVoice**, **TADA**, GPT-SoVITS) that clone a voice from a short recording. Switch voices and engines from the app.
+- **Body:** 2D Live2D or 3D VRM characters with lip sync. Add, update or replace them from the app.
+- Can be interrupted mid-sentence, remembers past chats (long-term memory), and can read your screen.
+- Everything lives in one folder. Move it to another drive and it keeps working.
 
-  
 <table>
   <tr>
     <td><img src="https://github.com/user-attachments/assets/f2a88171-f99b-4a78-a0d7-a03cc380c841" /></td>
@@ -18,92 +15,111 @@ Full demo and setup guide: https://youtu.be/gD1y4by3CPg?si=oinKcReuUd5xzjKT
   </tr>
 </table>
 
+## Install and start (one download)
+
+1. Download **`LocalAIVtuber-vX.Y.Z.zip`** from the [Releases page](../../releases) and extract it anywhere. Avoid OneDrive or other synced folders: models are large.
+2. Start it:
+   - **Windows:** double-click **`start.bat`**
+   - **macOS (Apple Silicon):** double-click **`start.command`**. The first time, macOS may ask you to confirm: right-click, then **Open**.
+   - **Linux:** run **`./start.sh`**
+3. The first start sets everything up inside the folder. Nothing is installed system-wide.
+   - It downloads a private Python and the app's packages (about 3 GB), plus the LLM runtime that matches your GPU.
+   - It asks which **brain** and **voice engine** to download. Press Enter to accept the recommendation for your hardware.
+   - It adds a **Local AI VTuber** shortcut with the app icon to your desktop (and the Start menu on Windows).
+4. The app opens in its own window. Closing that window (or clicking **Quit** in the app) stops the model, the voice and the server, and frees GPU memory.
+
+After that, use the desktop shortcut. Later starts take seconds.
+
+| Command | What it does |
+|---|---|
+| `start.bat` / `start.command` / `start.sh` | Install anything missing, then start |
+| `… --update` | Update the LLM runtime and Python packages |
+| `… --setup` | Choose the brain and voice engine to download again |
+| `… --no-window` | Run without opening a window (e.g. capture only in OBS from `http://127.0.0.1:8000`) |
+
+**Uninstall:** delete the folder (and the desktop shortcut).
+
+## Choosing a brain (LLM)
+
+Open the **Brain** page to download, switch or delete models. Download progress shows speed and time remaining, can be cancelled, and resumes if interrupted.
+
+| Model | Download | GPU memory for full speed | Notes |
+|---|---|---|---|
+| **Qwen3.8 27B Abliterated (IQ3_S)** | ~12 GB | 16 GB+ | Best conversation; uncensored; vision capable. On 8–12 GB GPUs it still runs (part on CPU) but replies start slower. |
+| **Gemma 4 12B (Q4)** | ~7.5 GB | 10–12 GB | Faster on mid-range GPUs; vision capable. |
+| Aya / Conversational 7B (Q4) | ~4.4 GB | 6 GB | Small, fine-tuned for personality. |
+
+- **Add from Hugging Face** on the Brain page accepts any GGUF repository, for example a smaller Qwen3.8 quant, and lets you pick the exact file.
+- You can also drop any `.gguf` into the models folder (**Brain → Models folder**) and it appears automatically.
+- "Think before answering" is off by default: thinking adds a long pause before the VTuber speaks.
+- llama.cpp auto-fits layers and context to your VRAM. Use **GPU layers → Manual** only to leave room for other apps.
+
+## Choosing a voice
+
+Open the **Voice** page and click **Install** on an engine. Each engine gets its own isolated environment, so they never conflict. Then select a voice from the library and type in the "Speak" box to hear it. It shows how long each line took, so you can compare engines.
+
+| Engine | Speed | Quality | Languages | GPU memory |
+|---|---|---|---|---|
+| **Chatterbox Turbo** (recommended) | ●●●●○ | ●●●●● | English | ~4 GB |
+| **LuxTTS** (fastest, CPU OK) | ●●●●● | ●●●●○ | English | ~1 GB |
+| **OmniVoice** | ●●●○○ | ●●●●● | 600+ | ~5 GB |
+| **TADA 1B / 3B** (Hume AI) | ●●●○○ | ●●●●○ | English / multilingual | ~6 / 12 GB |
+| GPT-SoVITS (classic) | ●●●○○ | ●●●○○ | en, ja, zh, ko, yue | ~3 GB |
+
+- **Add a voice:** drop a 6–15 second clean recording of one speaker and type exactly what is said. Every engine uses the same voice library. Chatterbox needs more than 5 seconds.
+- **TADA** uses Meta Llama 3.2. Accept the licenses on huggingface.co ([Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B), [tada-1b](https://huggingface.co/HumeAI/tada-1b)), then paste a free Hugging Face token in **Settings**.
+- Only one engine runs at a time, so switching frees the previous engine's GPU memory.
+
+## Characters
+
+On the **Character** page, choose **2D · Live2D** or **3D · VRM**, then:
+- **Add .zip** or **Add folder** for Live2D (Cubism 3/4, including VTube Studio exports), or **Add .vrm** for 3D (e.g. VRoid Studio). You can also drag a `.zip`/`.vrm` onto the stage.
+- Use the **⋯** menu on a model to **Replace** it with an updated version or **Delete** it.
+- Live2D position and size have sliders plus exact number fields.
+
+> The Live2D sample models in this repository are missing their texture files (they were never committed), so they show "Missing files". Use **Replace** with the full model, or use the bundled VRM characters.
+
 ## System requirements
 
-OS: Windows
+- **Windows 10/11, macOS 12+ on Apple Silicon, or 64-bit Linux.** Intel Macs are not supported (no current PyTorch builds).
+- **GPU:** NVIDIA GTX 10-series or newer (RTX 50-series supported), AMD/Intel via Vulkan for the LLM, or Apple Silicon. CPU-only works but is slow.
+- **Disk:** ~10 GB for the app and one voice engine, plus the model (4–12 GB).
+- Internet for the first setup and downloads; after that everything runs offline.
 
-GPU: NVIDIA GPU 40 series or older, recommend ~8gb vram
+## Where things are stored
 
-
-## Install
-### Windows
-If you are a Windows user, you can download the release package here, unzip and double click start.bat to start webui:
-[https://huggingface.co/xiaoheiqaq/LocalAiVtuber2-windows-package/resolve/main/LocalAIVtuber2.zip?download=true](https://huggingface.co/xiaoheiqaq/LocalAiVtuber2-windows-package/blob/main/LocalAIVtuber2v1.1.0.zip)
-
-### Install Manually
-
-#### 1. Install python 3.10
-https://www.python.org/downloads/release/python-3100/
-
-#### 2. Install CUDA toolkit 12.4
-https://developer.nvidia.com/cuda-12-4-0-download-archive
-
-#### 3. Create environemnt
-```
-cd backend
-python -m venv venv
-.\venv\Scripts\activate
-```
-
-#### 4. Install dependencies
-```
-pip install llama-cpp-python==0.2.90 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-pip install fastapi uvicorn qdrant-client[fastembed] pyautogui  sounddevice silero-vad easyocr==1.7.2 mss numpy==1.23.4 pytchat soxr
-pip install -r services\TTS\GPTsovits\requirements.txt
-```
-
-### 5. Start program
-```
-.\venv\Scripts\activate
-python server.py
-```
-
-After setup, you can also double click the ```start.bat``` file to start the program without needing to open the terminal.
-
-
-
-## Setting up from a clone
-This is for if you want to clone the repo for contributing to this project
-
-### 1. Clone the repo and follow the envrionemnt setup as described above
-
-
-### 2. Get the pretrained TTS model from the release package
-Copy this folder in the release package 
-```backend\services\TTS\GPTsovits\GPT_SoVITS\pretrained_models``` to the same location in the cloned project.
-
-
-### 3. Get ffmpeg from the release package
-Copy ```backend\ffmpeg.exe``` and ```backend\ffprobe.exe``` to same path in cloned project
-
-
-### 4. Build frontend
-
-Install nodejs https://nodejs.org/en/download
+Everything is inside the app folder:
 
 ```
-cd frontend
-npm i
-npm run build
+runtime/   private Python, app environment, voice-engine environments, llama.cpp
+cache/     downloaded model weights (Hugging Face cache), app window profile
+backend/services/LLM/Models/          language models (.gguf)
+backend/services/TTS/GPTsovits/models/ voice library
+backend/services/Character/...        Live2D and VRM models
+backend/settings.json                  your settings
 ```
 
-The project should be ready for development.
+No log files are written; recent output is kept in memory and visible in the app (e.g. **Voice → ⋯ → Show log**). If you move or rename the folder, the next start updates its internal paths and the desktop shortcut automatically.
 
-## FAQ
-### nltk error
-<img width="449" height="142" alt="image" src="https://github.com/user-attachments/assets/04a80930-5da0-439f-b6c6-23f4b993a543" />
+## Troubleshooting
 
-Open a terminal any where and run
+- **"The LLM runtime is missing"**: run `start.bat --update`.
+- **A download stopped**: start again; downloads resume where they left off.
+- **Replies are slow**: pick a smaller model (Gemma 4 12B), lower the memory window on the Brain page, or close other GPU-heavy apps.
+- **No sound**: click once anywhere in the app window (browsers block audio until you interact), and check the Voice page shows the engine as *Running*.
+- **Port 8000 in use**: set the environment variable `LAV_PORT` to another port before starting.
+
+## Development
+
+```bash
+# backend (uses the environment created by the launcher)
+runtime/envs/main/bin/python backend/server.py      # Windows: runtime\envs\main\Scripts\python.exe
+
+# frontend with hot reload (proxies /api to the backend on :8000)
+cd frontend && npm ci && npm run dev
+
+# build the release zip (frontend build + packaging)
+python launcher/package_release.py
 ```
-pip install nltk
-python -m nltk.downloader -d C:\nltk_data all
-```
 
-
-
-## Known issues
-
-NVIDIA 50 series GPU requires newer cuda versions which are not compatable right now
-
-AMD GPU does not support pytorch on windows so not compatable
+Pushing a tag `v*` builds the zip in GitHub Actions and attaches it to the release.

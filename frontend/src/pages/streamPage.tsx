@@ -1,15 +1,17 @@
 import { Stream } from "@/components/stream"
-import { Label } from "@/components/ui/label"
+import { PageBody, PageHeader } from "@/components/layout"
+import { Badge } from "@/components/ui/badge"
+import { Radio } from "lucide-react"
 
 function StreamPage() {
-
-
     return (
-        <div className="p-5 flex flex-col gap-4">
-            <Label className="text-sm text-muted-foreground">This is still an experiemental feature.</Label> 
-            <Stream></Stream>
-        </div>
+        <PageBody wide>
+            <PageHeader icon={Radio} title="Stream"
+                description="Read YouTube live chat and run karaoke setlists."
+                actions={<Badge variant="outline" className="border-warning/50 text-warning">Experimental</Badge>} />
+            <Stream />
+        </PageBody>
     )
-  }
-  
-  export default StreamPage
+}
+
+export default StreamPage

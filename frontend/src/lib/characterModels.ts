@@ -1,6 +1,10 @@
 export interface CharacterModel {
+    /** Folder name (Live2D) or file name (VRM) on disk. */
+    name: string;
     path: string;
     displayName: string;
+    /** Live2D only: referenced files (textures, .moc3) that are missing on disk. */
+    missing?: string[];
 }
 
 export interface ModelResponse {

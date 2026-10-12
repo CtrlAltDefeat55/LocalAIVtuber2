@@ -1,53 +1,120 @@
-import { useState } from "react"
-import { SidebarProvider } from "@/components/ui/sidebar"
+import { useEffect, useState } from "react"
+import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import { AppSidebar } from "@/components/app-sidebar"
-import pageMapping from "@/constants/page-mapping"
-import { SettingsProvider } from "@/context/SettingsContext"
+import pageMapping, { PageKey } from "@/constants/page-mapping"
+import { SettingsProvider, useSettings } from "@/context/SettingsContext"
+import { SystemStatusProvider, useSystemStatus } from "@/context/SystemStatusContext"
+import { ttsManager } from "@/lib/ttsManager"
+import { PowerOff } from "lucide-react"
+import appIcon from "@/assets/app-icon.svg"
 
-type PageKey = keyof typeof pageMapping
+const PAGE_STORAGE_KEY = "lav.page"
 
-function Mainpage() {
-    const [currentPage, setCurrentPage] = useState<PageKey>("llm")
+function initialPage(): PageKey {
+    try {
+        const saved = localStorage.getItem(PAGE_STORAGE_KEY)
+        if (saved && saved in pageMapping) return saved as PageKey
+    } catch { /* storage unavailable */ }
+    return "llm"
+}
+
+/** Keeps app-wide services in sync with saved settings, whichever page is open. */
+function SettingsBridge() {
+    const { settings } = useSettings()
+    useEffect(() => {
+        ttsManager.setSelectedProvider(settings["tts.provider"])
+    }, [settings["tts.provider"]]) // eslint-disable-line react-hooks/exhaustive-deps
+    useEffect(() => {
+        ttsManager.setSpeakingEnabled(settings["tts.enabled"] !== false)
+    }, [settings["tts.enabled"]]) // eslint-disable-line react-hooks/exhaustive-deps
+    return null
+}
+
+function Disconnected() {
+    return (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-background/95 backdrop-blur-sm">
+            <div className="max-w-sm text-center space-y-3">
+                <PowerOff className="mx-auto size-10 text-muted-foreground" />
+                <h2 className="text-lg font-semibold">The app is not running</h2>
+                <p className="text-sm text-muted-foreground">
+                    Local AI VTuber was closed or stopped responding. Start it again from the desktop shortcut
+                    or the start script; this page reconnects automatically.
+                </p>
+            </div>
+        </div>
+    )
+}
+
+function Shell() {
+    const [currentPage, setCurrentPage] = useState<PageKey>(initialPage)
+    const { connected } = useSystemStatus()
+    const { loading } = useSettings()
+
+    const navigate = (key: PageKey) => {
+        setCurrentPage(key)
+        try { localStorage.setItem(PAGE_STORAGE_KEY, key) } catch { /* ignore */ }
+    }
+
+    useEffect(() => {
+        const handler = (e: Event) => {
+            const key = (e as CustomEvent<string>).detail
+            if (key in pageMapping) navigate(key as PageKey)
+        }
+        window.addEventListener("lav:navigate", handler)
+        return () => window.removeEventListener("lav:navigate", handler)
+    }, [])
+
+    if (loading) {
+        return (
+            <div className="grid h-screen place-items-center">
+                <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
+                    <img src={appIcon} alt="" className="size-12 animate-pulse rounded-xl" />
+                    Starting Local AI VTuber…
+                </div>
+            </div>
+        )
+    }
 
     return (
-        <SidebarProvider open={false}>
-            <SettingsProvider>
-                    <AppSidebar onItemClick={setCurrentPage} activePage={currentPage} />
-                    <div className="flex flex-col w-full h-screen">
-                        <main className="flex-1 relative">
-                            {Object.entries(pageMapping).map(([key, { page: PageComponent }]) => {
-                                const isActive = currentPage === key;
-                                const unmount = key === "memory";
+        <>
+            <SettingsBridge />
+            <AppSidebar onItemClick={navigate} activePage={currentPage} />
+            <SidebarInset className="h-screen overflow-hidden">
+                <main className="relative flex-1 h-full">
+                    {(Object.keys(pageMapping) as PageKey[]).map((key) => {
+                        const { page: PageComponent, unmountWhenHidden } = pageMapping[key]
+                        const isActive = currentPage === key
+                        if (unmountWhenHidden) {
+                            return isActive ? (
+                                <div key={key} className="absolute inset-0"><PageComponent isActive /></div>
+                            ) : null
+                        }
+                        // Keep live pages (character renderer, pipeline) mounted but shrunk to 1px,
+                        // so hidden WebGL canvases cost almost nothing to render.
+                        return (
+                            <div key={key} aria-hidden={!isActive}
+                                className={isActive ? "absolute inset-0" : "absolute size-px overflow-hidden"}
+                                style={isActive ? undefined : { visibility: "hidden", pointerEvents: "none" }}>
+                                <PageComponent isActive={isActive} />
+                            </div>
+                        )
+                    })}
+                </main>
+            </SidebarInset>
+            {!connected && <Disconnected />}
+        </>
+    )
+}
 
-                                // Special handling for character page - minimize instead of unmount
-                                if (!unmount) {
-                                    return (
-                                        <div
-                                            key={key}
-                                            style={{
-                                                width: isActive ? "100%" : "1px",
-                                                height: isActive ? "100%" : "1px",
-                                                position: "absolute",
-                                                overflow: isActive ? "visible" : "hidden",
-                                                pointerEvents: isActive ? "auto" : "none",
-                                            }}
-                                        >
-                                            <PageComponent isActive={isActive} />
-                                        </div>
-                                    );
-                                }
-
-                                // Normal handling for other pages - mount/unmount
-                                return isActive ? (
-                                    <div key={key} className="absolute w-full h-full">
-                                        <PageComponent isActive={true} />
-                                    </div>
-                                ) : null;
-                            })}
-                        </main>
-                    </div>
-            </SettingsProvider>
-        </SidebarProvider>
+function Mainpage() {
+    return (
+        <SettingsProvider>
+            <SystemStatusProvider>
+                <SidebarProvider defaultOpen={!document.cookie.includes("sidebar_state=false")}>
+                    <Shell />
+                </SidebarProvider>
+            </SystemStatusProvider>
+        </SettingsProvider>
     );
 }
 

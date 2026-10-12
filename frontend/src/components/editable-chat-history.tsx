@@ -101,17 +101,16 @@ export default function EditableChatHistory({ messages, sessionId, onUpdate, onC
         <div className="flex flex-col space-y-4">
             {messages.map((message, index) => (
                 <div key={index} className="group relative flex flex-col gap-1.5">
-                    <div className={`text-xs text-muted-foreground ${message.role === 'user'
+                    <div className={`text-xs font-medium text-muted-foreground ${message.role === 'user'
                         ? 'self-end'
                         : 'self-start'
                     }`}>
-                        {message.role === 'user' ? 'You' : 'AI'}
+                        {message.role === 'user' ? 'You' : 'VTuber'}
                     </div>
                     <div
-                        className={`break-words max-w-7/10 w-fit px-4 py-2 rounded-md text-sm font-medium shadow-xs bg-secondary text-secondary-foreground
-                             ${message.role === 'user'
-                                ? 'self-end'
-                                : 'self-start'
+                        className={`break-words max-w-[80%] w-fit px-4 py-2.5 text-[15px] leading-relaxed ${message.role === 'user'
+                                ? 'self-end rounded-2xl rounded-br-md bg-primary text-primary-foreground'
+                                : 'self-start rounded-2xl rounded-bl-md border bg-card text-card-foreground shadow-xs'
                             }`}
                     >
                         {editingMessageIndex === index ? (
@@ -133,26 +132,23 @@ export default function EditableChatHistory({ messages, sessionId, onUpdate, onC
                                 </div>
                             </div>
                         ) : (
-                            <div className={`whitespace-pre-wrap ${message.role === 'user'
-                                ? 'opacity-80'
-                                : 'opacity-100'
-                            }`}>{message.content}</div>
+                            <div className="whitespace-pre-wrap">{message.content || <span className="inline-flex gap-1 opacity-60"><span className="animate-pulse">●</span><span className="animate-pulse [animation-delay:150ms]">●</span><span className="animate-pulse [animation-delay:300ms]">●</span></span>}</div>
                         )}
                     </div>
                     {editingMessageIndex !== index && (
-                        <div className={`opacity-0 group-hover:opacity-100 transition-opacity ${message.role === 'user'
+                        <div className={`-mt-1 flex opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity ${message.role === 'user'
                                 ? 'self-end ml-auto'
                                 : 'self-start mr-auto'
                             }`}>
                             <TooltipProvider>
                                 <Tooltip>
                                     <TooltipTrigger asChild>
-                                        <Button variant="ghost" size="sm" onClick={() => continueMessage(index)}>
+                                        <Button variant="ghost" size="sm" aria-label="Continue this message" onClick={() => continueMessage(index)}>
                                             <ArrowRight className="h-4 w-4" />
                                         </Button>
                                     </TooltipTrigger>
                                     <TooltipContent side="bottom" sideOffset={14}>
-                                        Continue Message
+                                        Continue this message
                                     </TooltipContent>
                                 </Tooltip>
                             </TooltipProvider>
@@ -160,12 +156,12 @@ export default function EditableChatHistory({ messages, sessionId, onUpdate, onC
                                 <TooltipProvider>
                                     <Tooltip>
                                         <TooltipTrigger asChild>
-                                            <Button variant="ghost" size="sm" onClick={() => regenerateMessage(index)}>
+                                            <Button variant="ghost" size="sm" aria-label="Regenerate reply" onClick={() => regenerateMessage(index)}>
                                                 <RotateCcw className="h-4 w-4" />
                                             </Button>
                                         </TooltipTrigger>
                                         <TooltipContent side="bottom" sideOffset={14}>
-                                            Regenerate Message
+                                            Regenerate reply
                                         </TooltipContent>
                                     </Tooltip>
                                 </TooltipProvider>
@@ -173,24 +169,24 @@ export default function EditableChatHistory({ messages, sessionId, onUpdate, onC
                             <TooltipProvider>
                                 <Tooltip>
                                     <TooltipTrigger asChild>
-                                        <Button variant="ghost" size="sm" onClick={() => startEditing(index)}>
+                                        <Button variant="ghost" size="sm" aria-label="Edit message" onClick={() => startEditing(index)}>
                                             <Edit3 className="h-4 w-4" />
                                         </Button>
                                     </TooltipTrigger>
                                     <TooltipContent side="bottom" sideOffset={14}>
-                                        Edit Message
+                                        Edit
                                     </TooltipContent>
                                 </Tooltip>
                             </TooltipProvider>
                             <TooltipProvider>
                                 <Tooltip>
                                     <TooltipTrigger asChild>
-                                        <Button variant="ghost" size="sm" onClick={() => deleteMessage(index)}>
+                                        <Button variant="ghost" size="sm" aria-label="Delete message" onClick={() => deleteMessage(index)}>
                                             <Trash className="h-4 w-4" />
                                         </Button>
                                     </TooltipTrigger>
                                     <TooltipContent side="bottom" sideOffset={14}>
-                                        Delete Message
+                                        Delete
                                     </TooltipContent>
                                 </Tooltip>
                             </TooltipProvider>

@@ -1,6 +1,5 @@
 import asyncio
 import os
-import wave
 from fastapi import WebSocket
 import sounddevice as sd
 import numpy as np
@@ -12,7 +11,6 @@ from ..lib.LAV_logger import logger
 
 class VoiceInput:
     current_module_directory = os.path.dirname(__file__)
-    MIC_OUTPUT_PATH = os.path.join(current_module_directory, "voice_recording.wav")
 
     SAMPLING_RATE = 16000
     input_language = "en"
@@ -25,16 +23,30 @@ class VoiceInput:
     PRE_SPEECH_SAMPLES = 0.5 * SAMPLING_RATE
     POST_SPEECH_SAMPLES = 0.5 * SAMPLING_RATE
 
-    vad_model = load_silero_vad()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    whisper_model = WhisperModel("medium", device=device)
-
-    vad_iterator = VADIterator(vad_model, sampling_rate=SAMPLING_RATE)
     running = False
 
     def __init__(self):
+        # Speech models load on first use, so startup stays fast and no VRAM
+        # is spent when the microphone is never used.
+        self.vad_model = None
+        self.whisper_model = None
+        self.vad_iterator = None
         self._reset_buffers()
         self.last_transcription = None
+
+    def _ensure_models(self):
+        if self.whisper_model is not None:
+            return
+        logger.info("Loading speech recognition models (first use)...")
+        self.vad_model = load_silero_vad()
+        try:
+            if not torch.cuda.is_available():
+                raise RuntimeError("no CUDA device")
+            self.whisper_model = WhisperModel("medium", device="cuda", compute_type="float16")
+        except Exception as e:
+            logger.info(f"Speech recognition running on CPU ({e})")
+            self.whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
+        self.vad_iterator = VADIterator(self.vad_model, sampling_rate=self.SAMPLING_RATE)
 
     def _reset_buffers(self):
         self.sentence_audio_buffer = []
@@ -46,6 +58,11 @@ class VoiceInput:
         if self.running:
             return
         self.running = True
+        try:
+            await asyncio.to_thread(self._ensure_models)
+        except Exception:
+            self.running = False
+            raise
         logger.info("Started recording")
 
         loop = asyncio.get_event_loop()
@@ -97,7 +114,7 @@ class VoiceInput:
                 post = self.tmp_audio_buffer[:int(self.POST_SPEECH_SAMPLES)]
                 self.sentence_audio_buffer.extend(post)
 
-                transcribed_text = self.process_speech(np.array(self.sentence_audio_buffer))
+                transcribed_text = await asyncio.to_thread(self.process_speech, np.array(self.sentence_audio_buffer))
                 if transcribed_text and transcribed_text not in self.whisper_filter_list:
                     if transcribed_text != self.last_transcription:
                         self.last_transcription = transcribed_text  
@@ -110,14 +127,8 @@ class VoiceInput:
                 self._reset_buffers()
 
     def process_speech(self, audio_data):
-        with wave.open(self.MIC_OUTPUT_PATH, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes((audio_data * 32768.0).astype(np.int16).tobytes())
-
         transcribed_text = ''
-        segments, _ = self.whisper_model.transcribe(self.MIC_OUTPUT_PATH, language=self.input_language)
+        segments, _ = self.whisper_model.transcribe(audio_data.astype(np.float32), language=self.input_language)
         for segment in segments:
             transcribed_text += segment.text
 
@@ -127,6 +138,7 @@ class VoiceInput:
 
     def run_cli(self):
         print("🎙️ Running in CLI mode. Press Ctrl+C to stop.")
+        self._ensure_models()
         loop = asyncio.get_event_loop()
 
         def audio_callback(indata, frames, time, status):
@@ -166,7 +178,7 @@ class VoiceInput:
                 post = self.tmp_audio_buffer[:int(self.POST_SPEECH_SAMPLES)]
                 self.sentence_audio_buffer.extend(post)
 
-                transcribed_text = self.process_speech(np.array(self.sentence_audio_buffer))
+                transcribed_text = await asyncio.to_thread(self.process_speech, np.array(self.sentence_audio_buffer))
                 if transcribed_text:
                     print(f"📝 Transcription: {transcribed_text}")
 

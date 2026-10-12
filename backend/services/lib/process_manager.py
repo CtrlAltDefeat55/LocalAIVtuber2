@@ -1,168 +1,248 @@
-import subprocess
-import threading
-import queue
-import time
+"""Owns every helper process the app starts (RVC, TTS engines, llama-server).
+
+Children are placed in their own process group and, on Windows, in a Job
+Object configured to kill them when this process exits - so closing the
+console window or a crash cannot leave a GPU-hogging server behind.
+Only processes started here are ever stopped; nothing is killed by name.
+"""
+import atexit
 import os
-from typing import Optional, Tuple, Dict, Any
-from dataclasses import dataclass
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Optional, Tuple
+
 from .LAV_logger import logger
 from .startup_progress import startup_progress
 
+LOG_LINES_KEPT = 300  # bounded in-memory diagnostics per process; nothing is written to disk
+
+
 @dataclass
 class ServerProcess:
-    """Data class to hold server process information"""
     process: subprocess.Popen
-    log_queue: queue.Queue
-    ready_event: threading.Event
-    port: int
     name: str
+    port: int
+    ready_event: threading.Event
+    logs: deque = field(default_factory=lambda: deque(maxlen=LOG_LINES_KEPT))
+
+
+class _WindowsJob:
+    """Kill-on-close Job Object so children never outlive the app on Windows."""
+
+    def __init__(self):
+        self.handle = None
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+            class BASIC(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class EXTENDED(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", BASIC),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            job = kernel32.CreateJobObjectW(None, None)
+            info = EXTENDED()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            ok = kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
+            if job and ok:
+                self.handle = job
+                self._kernel32 = kernel32
+        except Exception as e:  # never block startup over this
+            logger.debug(f"Job object unavailable: {e}")
+
+    def assign(self, process: subprocess.Popen):
+        if self.handle:
+            try:
+                self._kernel32.AssignProcessToJobObject(self.handle, int(process._handle))
+            except Exception as e:
+                logger.debug(f"Could not assign process to job: {e}")
+
 
 class ProcessManager:
     def __init__(self):
         self.processes: Dict[str, ServerProcess] = {}
+        self._lock = threading.Lock()
+        self._job = _WindowsJob()
+        atexit.register(self.stop_all_servers)
 
-    def _read_output(self, pipe, prefix: str, log_queue: queue.Queue, ready_event: threading.Event, ready_message: str):
-        """Read output from a process pipe and handle logging"""
+    def _read_output(self, pipe, proc: ServerProcess, ready_message: Optional[str]):
         try:
             for line in pipe:
-                log_line = f"{prefix}: {line.strip()}"
-                log_queue.put(log_line)
-                logger.info(log_line)
-                
-                # Check for server ready message
-                if ready_message in line:
-                    ready_event.set()
+                line = line.rstrip()
+                if not line:
+                    continue
+                proc.logs.append(line)
+                logger.info(f"{proc.name}: {line}")
+                if ready_message and ready_message in line:
+                    proc.ready_event.set()
         except Exception as e:
-            logger.error(f"Error reading {prefix} output: {e}")
+            logger.debug(f"Stopped reading {proc.name} output: {e}")
 
-    def start_server_process(
+    def start_process(
         self,
         name: str,
-        python_path: str,
-        script_path: str,
+        cmd: list,
         port: int,
-        ready_message: str = "Uvicorn running on",
-        timeout: int = 30,
+        ready_message: Optional[str] = None,
+        ready_check: Optional[Callable[[], bool]] = None,
+        timeout: float = 60,
         cwd: Optional[str] = None,
-        env: Optional[Dict[str, str]] = None
+        env: Optional[Dict[str, str]] = None,
+        show_progress: bool = False,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> Tuple[bool, str]:
-        """
-        Start a Python server process using a python.exe.
-        
-        Args:
-            name: Name of the server process
-            python_path: Path to the virtual environment directory
-            script_path: Path to the python script to run
-            port: Port the server will run on
-            ready_message: Message that indicates the server is ready
-            timeout: Maximum time to wait for server to be ready (seconds)
-            cwd: Working directory for the process
-            env: Additional environment variables
-            
-        Returns:
-            Tuple[bool, str]: (success, message)
-        """
+        """Start an owned process and wait until it reports ready, exits, or times out."""
+        self.stop_server(name)
         start_time = time.time()
-        startup_progress.show_step(f"Starting {name} Server")
+        if show_progress:
+            startup_progress.show_step(f"Starting {name}")
+
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
 
         try:
-            if not os.path.exists(python_path):
-                msg = f"{name} server startup failed - virtual environment not found"
-                startup_progress.complete_step(f"{msg} in {time.time() - start_time:.2f}s")
-                return False, msg
-                
-            if not os.path.exists(script_path):
-                msg = f"{name} server startup failed - server script not found"
-                startup_progress.complete_step(f"{msg} in {time.time() - start_time:.2f}s")
-                return False, msg
-
-            # Create process tracking objects
-            log_queue = queue.Queue()
-            ready_event = threading.Event()
-            ready_event.clear()
-            
-            # Start the server process
             process = subprocess.Popen(
-                [python_path, script_path],
+                [str(c) for c in cmd],
                 cwd=cwd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
-                universal_newlines=True,
-                env=env
+                env={**os.environ, **(env or {})},
+                **kwargs,
             )
-            
-            # Start threads to read stdout and stderr
-            threading.Thread(
-                target=self._read_output,
-                args=(process.stdout, name, log_queue, ready_event, ready_message),
-                daemon=True
-            ).start()
-            
-            threading.Thread(
-                target=self._read_output,
-                args=(process.stderr, f"{name}", log_queue, ready_event, ready_message),
-                daemon=True
-            ).start()
-            
-            # Store process information
-            self.processes[name] = ServerProcess(
-                process=process,
-                log_queue=log_queue,
-                ready_event=ready_event,
-                port=port,
-                name=name
-            )
-            
-            # Wait for server to be ready with a timeout
-            if ready_event.wait(timeout=timeout):
-                msg = f"{name} server started successfully"
-                startup_progress.complete_step(f"{msg} in {time.time() - start_time:.2f}s")
-                return True, msg
-            else:
-                # If timeout occurs, stop the server
-                self.stop_server(name)
-                msg = f"{name} server failed to start within timeout period"
-                startup_progress.complete_step(f"{msg} in {time.time() - start_time:.2f}s")
-                return False, msg
-                
         except Exception as e:
-            logger.error(f"Error starting {name} server: {e}")
-            msg = f"{name} server startup failed with error: {str(e)}"
-            startup_progress.complete_step(f"{msg} in {time.time() - start_time:.2f}s")
+            msg = f"{name} failed to start: {e}"
+            logger.error(msg)
             return False, msg
 
-    def stop_server(self, name: str) -> bool:
-        """Stop a server process by name"""
-        if name in self.processes:
+        self._job.assign(process)
+        proc = ServerProcess(process=process, name=name, port=port, ready_event=threading.Event())
+        with self._lock:
+            self.processes[name] = proc
+        threading.Thread(target=self._read_output, args=(process.stdout, proc, ready_message), daemon=True).start()
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if proc.ready_event.is_set() or (ready_check and ready_check()):
+                msg = f"{name} ready in {time.time() - start_time:.1f}s"
+                if show_progress:
+                    startup_progress.complete_step(msg)
+                return True, msg
+            if process.poll() is not None:
+                tail = "\n".join(list(proc.logs)[-15:])
+                self.stop_server(name)
+                return False, f"{name} exited during startup (code {process.returncode}).\n{tail}"
+            if is_cancelled and is_cancelled():
+                self.stop_server(name)
+                return False, f"{name} start cancelled"
+            time.sleep(0.25)
+
+        self.stop_server(name)
+        msg = f"{name} did not become ready within {timeout:.0f}s"
+        if show_progress:
+            startup_progress.complete_step(msg)
+        return False, msg
+
+    def start_server_process(self, name, python_path, script_path, port, ready_message="Uvicorn running on",
+                             timeout=30, cwd=None, env=None) -> Tuple[bool, str]:
+        """Compatibility wrapper used by the RVC plugin."""
+        if not os.path.exists(python_path):
+            return False, f"{name} runtime not installed"
+        if not os.path.exists(script_path):
+            return False, f"{name} server script not found"
+        return self.start_process(name, [python_path, script_path], port, ready_message=ready_message,
+                                  timeout=timeout, cwd=cwd, env=env, show_progress=True)
+
+    def stop_server(self, name: str, grace: float = 5.0) -> bool:
+        with self._lock:
+            proc = self.processes.pop(name, None)
+        if not proc:
+            return False
+        p = proc.process
+        if p.poll() is not None:
+            if p.stdout:
+                p.stdout.close()
+            return True
+        try:
+            if sys.platform == "win32":
+                # Helpers keep no state worth flushing; TerminateProcess is immediate.
+                # The tree kill below still runs if a grandchild keeps it alive.
+                p.terminate()
+            else:
+                os.killpg(p.pid, signal.SIGTERM)
+        except Exception:
+            p.terminate()
+        try:
+            p.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"{name} did not exit in {grace:.0f}s, killing it")
             try:
-                self.processes[name].process.terminate()
-                del self.processes[name]
-                return True
-            except Exception as e:
-                logger.error(f"Error stopping {name} server: {e}")
-        return False
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+                else:
+                    os.killpg(p.pid, signal.SIGKILL)
+            except Exception:
+                p.kill()
+            try:
+                p.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+        if p.stdout:
+            p.stdout.close()
+        logger.info(f"{name} stopped")
+        return True
 
     def stop_all_servers(self):
-        """Stop all running server processes"""
         for name in list(self.processes.keys()):
             self.stop_server(name)
 
     def get_server_logs(self, name: str) -> list:
-        """Get all logs from a server's queue"""
-        if name in self.processes:
-            logs = []
-            while not self.processes[name].log_queue.empty():
-                logs.append(self.processes[name].log_queue.get())
-            return logs
-        return []
+        proc = self.processes.get(name)
+        return list(proc.logs) if proc else []
 
     def is_server_running(self, name: str) -> bool:
-        """Check if a server is running and responding"""
-        if name in self.processes:
-            return self.processes[name].process.poll() is None
-        return False
+        proc = self.processes.get(name)
+        return bool(proc) and proc.process.poll() is None
 
-# Create a global process manager instance
-process_manager = ProcessManager() 
+
+process_manager = ProcessManager()

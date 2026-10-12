@@ -4,7 +4,7 @@ from .LAV_logger import logger
 class StartupProgress:
     def __init__(self):
         self.current_step = 0
-        self.total_steps = 5  # 1 import step + 5 main steps
+        self.total_steps = 3  # imports, services, settings
         self.current_message = ""
         self.step_start_time = None
         

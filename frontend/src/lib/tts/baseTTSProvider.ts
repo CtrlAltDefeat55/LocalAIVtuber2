@@ -1,3 +1,3 @@
 export abstract class BaseTTSProvider {
-    abstract generateAudio(text: string): Promise<Response>;
+    abstract generateAudio(text: string, signal?: AbortSignal): Promise<Response>;
 }

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as PIXI from 'pixi.js';
 import { Live2DModel } from 'pixi-live2d-display';
 import { globalStateManager } from "@/lib/globalStateManager";
@@ -11,87 +11,94 @@ declare global {
 
 interface Live2DCanvasProps {
   modelPath: string;
-  xPosition: number; // 0-100 percentage
-  yPosition: number; // 0-100 percentage  
-  scale: number; // 0.1-3.0 scale factor
+  /** Model centre as a percentage of the stage width (0 = left edge, 100 = right edge). */
+  xPosition: number;
+  /** Model centre as a percentage of the stage height (0 = top, 100 = bottom). */
+  yPosition: number;
+  /** Scale factor relative to the model's native size. */
+  scale: number;
+  onStatus?: (status: "loading" | "ready" | "error", message?: string) => void;
 }
 
-const Live2DCanvas: React.FC<Live2DCanvasProps> = ({ modelPath, xPosition, yPosition, scale }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+const Live2DCanvas: React.FC<Live2DCanvasProps> = ({ modelPath, xPosition, yPosition, scale, onStatus }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
   const appRef = useRef<PIXI.Application | null>(null);
-  const modelRef = useRef<Live2DModel>(null);
+  const modelRef = useRef<Live2DModel | null>(null);
+  const transform = useRef({ xPosition, yPosition, scale });
+  const [error, setError] = useState<string | null>(null);
+  transform.current = { xPosition, yPosition, scale };
 
-  // Function to update model position and scale
-  const updateModelTransform = () => {
-    if (modelRef.current) {
-      // Convert percentage to pixel position
-      modelRef.current.x = (xPosition / 100) * window.innerWidth;
-      modelRef.current.y = (yPosition / 100) * window.innerHeight;
-      modelRef.current.scale.set(scale, scale);
-    }
+  // Positions are relative to the stage (this component's box), not the browser window.
+  const applyTransform = () => {
+    const app = appRef.current;
+    const model = modelRef.current;
+    if (!app || !model) return;
+    const { xPosition, yPosition, scale } = transform.current;
+    model.x = (xPosition / 100) * app.screen.width;
+    model.y = (yPosition / 100) * app.screen.height;
+    model.scale.set(scale, scale);
   };
 
   useEffect(() => {
-    // Expose PIXI for live2d-display
     window.PIXI = PIXI;
+    const container = containerRef.current;
+    if (!container) return;
 
-    if (!canvasRef.current) return;
-
-    const app = new PIXI.Application({
-      view: canvasRef.current,
-      resizeTo: window,
-      backgroundAlpha: 0
-    });
+    const app = new PIXI.Application({ resizeTo: container, backgroundAlpha: 0, antialias: true });
+    container.appendChild(app.view as HTMLCanvasElement);
     appRef.current = app;
+    let cancelled = false;
+    setError(null);
+    onStatus?.("loading");
 
-    (async () => {
-      try {
-        const model = Live2DModel.fromSync(modelPath, { onError: console.warn, autoInteract: false });
-        model.once('load', async () => {
-            // Set initial position and scale using props
-            model.x = (xPosition / 100) * window.innerWidth;
-            model.y = (yPosition / 100) * window.innerHeight;
-            model.scale.set(scale, scale);
-            model.anchor.set(0.5, 0.5);
-            app.stage.addChild(model);
-            modelRef.current = model;
+    const model = Live2DModel.fromSync(modelPath, {
+      autoInteract: false,
+      onError: (e: Error) => {
+        if (cancelled) return;
+        console.warn(e);
+        setError("This Live2D model could not be loaded. Make sure the folder contains its .model3.json and all textures.");
+        onStatus?.("error", String(e));
+      },
+    });
+    model.once('load', () => {
+      if (cancelled) { model.destroy(); return; }
+      model.anchor.set(0.5, 0.5);
+      app.stage.addChild(model);
+      modelRef.current = model;
+      applyTransform();
+      onStatus?.("ready");
+      app.ticker.add(() => {
+        const volume = globalStateManager.getState("ttsLiveVolume");
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (model.internalModel.coreModel as any).setParameterValueById("ParamMouthOpen", volume);
+      });
+    });
 
-            console.log(model)
-            app.ticker.add(() => {
-              if (modelRef.current) {
-                const volume = globalStateManager.getState("ttsLiveVolume");
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                (modelRef.current.internalModel.coreModel as any).setParameterValueById(
-                  "ParamMouthOpen",
-                  volume
-                );
-              }
-            });
-          });
+    // Follow the container size (sidebar, inspector panel, window) and re-place the model.
+    const observer = new ResizeObserver(() => {
+      app.resize();
+      applyTransform();
+    });
+    observer.observe(container);
 
-      } catch (err) {
-        console.error('Failed to load Live2D model:', err);
-      }
-    })();
-
-  }, [modelPath]);
-
-  // Update model transform when position or scale props change
-  useEffect(() => {
-    updateModelTransform();
-  }, [xPosition, yPosition, scale]);
-
-  // Handle window resize
-  useEffect(() => {
-    const handleResize = () => {
-      updateModelTransform();
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+      modelRef.current = null;
+      appRef.current = null;
+      app.destroy(true, { children: true, texture: true, baseTexture: true });
     };
+  }, [modelPath]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, [xPosition, yPosition, scale]);
+  useEffect(applyTransform, [xPosition, yPosition, scale]);
 
-  return <canvas ref={canvasRef} className="w-full h-full" />;
+  return (
+    <div ref={containerRef} className="relative h-full w-full overflow-hidden">
+      {error && (
+        <div className="absolute inset-0 grid place-items-center p-6 text-center text-sm text-muted-foreground">{error}</div>
+      )}
+    </div>
+  );
 };
 
 export default Live2DCanvas;

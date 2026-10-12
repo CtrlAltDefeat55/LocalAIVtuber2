@@ -1,12 +1,15 @@
 import PipelineDebugger from "@/components/pipeline-debugger"
+import { PageBody, PageHeader } from "@/components/layout"
+import { SquareActivity } from "lucide-react"
 
 function PipelineMonitorPage() {
     return (
-        <div className="p-5">
-            <h3 className="scroll-m-20 text-2xl font-semibold tracking-tight">Pipeline Monitor</h3>
+        <PageBody wide>
+            <PageHeader icon={SquareActivity} title="Pipeline"
+                description="Each message flows through the brain (text), the voice (audio) and playback. Use this to see where a reply is waiting." />
             <PipelineDebugger />
-        </div>
+        </PageBody>
     )
-  }
-  
-  export default PipelineMonitorPage
+}
+
+export default PipelineMonitorPage

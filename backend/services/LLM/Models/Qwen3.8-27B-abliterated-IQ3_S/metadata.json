@@ -1,0 +1,14 @@
+{
+    "displayName": "Qwen3.8 27B Abliterated (IQ3_S)",
+    "description": "Strongest conversation quality. Uncensored (abliterated) Qwen3.8 27B, 3-bit IQ3_S quant. Can see your screen when Vision is enabled. Runs fully on a 16 GB GPU; on 8-12 GB it still works but part of it runs on the CPU, so replies start slower.",
+    "repo": "huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF",
+    "quant": "IQ3_S",
+    "exclude": ["mtp", "swift", "gsq"],
+    "vision": true,
+    "type": "text",
+    "size_hint": "~12 GB",
+    "vram_hint": "16 GB recommended",
+    "tags": ["Recommended", "Uncensored", "Vision"],
+    "recommended": true,
+    "order": 1
+}
