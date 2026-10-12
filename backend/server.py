@@ -1,5 +1,6 @@
 import sys
 import os
+import shutil
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
@@ -511,19 +512,40 @@ class SettingsManager:
         self._lock = threading.Lock()
 
     def load_settings(self) -> Dict[str, Any]:
-        try:
-            with open(self.settings_file, "r", encoding="utf-8") as file:
-                return json.load(file)
-        except FileNotFoundError:
-            return {}
-        except (OSError, json.JSONDecodeError) as e:
-            logger.error(f"settings.json is unreadable ({e}); starting with defaults")
-            return {}
+        """settings.json, else the last good copy (settings.json.bak), else built-in defaults."""
+        backup = self.settings_file + ".bak"
+        for path in (self.settings_file, backup):
+            try:
+                with open(path, "r", encoding="utf-8") as file:
+                    data = json.load(file)
+                if not isinstance(data, dict):
+                    raise ValueError("not a settings object")
+                if path == backup:
+                    logger.warning("settings.json was damaged; restored your last saved settings")
+                    self.save_settings(data)
+                return data
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as e:
+                logger.error(f"{os.path.basename(path)} is unreadable ({e})")
+                if path == self.settings_file:  # keep the damaged file for inspection
+                    try:
+                        os.replace(path, self.settings_file + ".damaged")
+                    except OSError:
+                        pass
+        return {}
 
     def save_settings(self, settings: Dict[str, Any]):
         tmp = self.settings_file + ".tmp"
         with open(tmp, "w", encoding="utf-8") as file:
             json.dump(settings, file, indent=4, ensure_ascii=False)
+            file.flush()
+            os.fsync(file.fileno())
+        if os.path.exists(self.settings_file):
+            try:  # last good copy, used if the main file is ever damaged
+                shutil.copy2(self.settings_file, self.settings_file + ".bak")
+            except OSError:
+                pass
         os.replace(tmp, self.settings_file)  # atomic: a crash never leaves a half-written file
 
     def apply_settings(self, keys=None):

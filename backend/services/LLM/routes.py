@@ -76,7 +76,7 @@ async def resolve_files(model: dict) -> tuple[list[DownloadFile], dict]:
     if not chosen:
         raise FileNotFoundError(f"No GGUF file for quant '{model.get('quant')}' found in {repo}")
     files = [DownloadFile(url=hf_file_url(repo, f["path"]), dest=folder / os.path.basename(f["path"]),
-                          size=f["size"]) for f in chosen]
+                          size=f["size"], sha256=f.get("sha256")) for f in chosen]
     local = {"fileName": os.path.basename(chosen[0]["path"]),
              "parts": [os.path.basename(f["path"]) for f in chosen]}
     proj_path = model.get("mmproj_file")
@@ -84,7 +84,7 @@ async def resolve_files(model: dict) -> tuple[list[DownloadFile], dict]:
         pick_mmproj(listing) if model.get("vision") else None)
     if proj:
         files.append(DownloadFile(url=hf_file_url(repo, proj["path"]), dest=folder / "mmproj.gguf",
-                                  size=proj["size"]))
+                                  size=proj["size"], sha256=proj.get("sha256")))
         local["mmproj_path"] = "mmproj.gguf"
     return files, local
 

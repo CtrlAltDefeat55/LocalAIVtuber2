@@ -7,7 +7,13 @@ the computer. Uses only the standard library.
   (no options)     install anything missing, then open the app
   --update         also update the LLM runtime and Python packages
   --setup          re-run the hardware check and the model / voice choices
+  --repair         re-check every installed file byte-for-byte and fix what is damaged
   --no-window      run the server without opening a window (e.g. for OBS only)
+
+Setup is resumable and self-repairing: each step records when it starts and
+finishes, downloads continue where they stopped, and on every start the app's
+files, Python packages and runtimes are checked (sizes; full checksums for any
+step that was interrupted) so only what is missing or damaged is fetched again.
 
 Everything is kept inside this folder (runtime/, cache/), so the folder can be
 moved or renamed; nothing is written to system locations except the optional
@@ -15,6 +21,7 @@ desktop/start-menu shortcuts.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -95,15 +102,63 @@ def ask(question, options, default):
 
 
 def load_state():
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    """Setup progress. Written atomically with a backup, so a crash can't lose it."""
+    for f in (STATE_FILE, STATE_FILE.with_suffix(".json.bak")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (OSError, ValueError):
+            continue
+    return {}
 
 
 def save_state(state):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    if STATE_FILE.exists():
+        shutil.copy2(STATE_FILE, STATE_FILE.with_suffix(".json.bak"))
+    os.replace(tmp, STATE_FILE)
+
+
+STEP_NAMES = {"app_files": "checking the app files", "main_env": "installing the app's Python packages",
+              "llama": "installing the LLM runtime", "voice": "installing the voice engine",
+              "llm": "downloading the language model"}
+
+
+def unfinished_steps(state) -> list:
+    steps = state.get("in_progress") or []
+    return [steps] if isinstance(steps, str) else list(steps)
+
+
+def begin_step(state, name):
+    """Recorded before the work starts, so an interruption is known on the next start."""
+    steps = unfinished_steps(state)
+    if name not in steps:
+        steps.append(name)
+    state["in_progress"] = steps
+    save_state(state)
+
+
+def end_step(state, name):
+    state["in_progress"] = [s for s in unfinished_steps(state) if s != name]
+    if not state["in_progress"]:
+        state.pop("in_progress")
+    save_state(state)
+
+
+def integrity():
+    """backend/services/lib/integrity.py (standard library only), loaded without the app's environment."""
+    path = BACKEND / "services" / "lib" / "integrity.py"
+    try:
+        spec = importlib.util.spec_from_file_location("lav_integrity", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as e:
+        say(f"    (File check unavailable: {e})")
+        return None
 
 
 def run(cmd, **kw):
@@ -114,8 +169,39 @@ def run(cmd, **kw):
     return proc
 
 
-def download(url, dest: Path, label=None):
-    """Download with a simple progress line; resumes via .part files."""
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def download(url, dest: Path, label=None, size=None, sha256=None, attempts=5):
+    """Download with progress; resumes via .part files, retries dropped connections and
+    checks size / SHA-256 when known. A corrupted result is deleted and fetched again."""
+    if dest.exists() and (not size or dest.stat().st_size == size) and (not sha256 or sha256_of(dest) == sha256):
+        return dest
+    dest.unlink(missing_ok=True)
+    for attempt in range(1, attempts + 1):
+        try:
+            _download_once(url, dest, label)
+            if size and dest.stat().st_size != size:
+                raise IOError(f"got {dest.stat().st_size} of {size} bytes")
+            if sha256 and sha256_of(dest) != sha256:
+                dest.unlink(missing_ok=True)
+                raise IOError("checksum mismatch: the file was corrupted during download")
+            return dest
+        except (urllib.error.URLError, OSError, ConnectionError) as e:
+            code = getattr(e, "code", None)
+            if attempt == attempts or (code and 400 <= code < 500 and code not in (408, 429)):
+                raise  # out of retries, or a permanent error such as 404
+            wait = 2 ** attempt
+            say(f"\n    Download interrupted ({e}); retrying in {wait}s ({attempt}/{attempts - 1})")
+            time.sleep(wait)
+
+
+def _download_once(url, dest: Path, label=None):
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     have = part.stat().st_size if part.exists() else 0
@@ -146,12 +232,15 @@ def download(url, dest: Path, label=None):
                     print(f"\r    {label or dest.name}: {have / 1e6:8.1f} MB {pct}", end="", flush=True)
                     last = time.time()
     print()
+    if total and have < total:
+        raise IOError(f"connection closed early ({have} of {total} bytes); resuming")
     part.replace(dest)
     return dest
 
 
 def extract(archive: Path, target: Path):
     """Extract zip/tar.gz, flattening a single top-level folder."""
+    target.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(dir=target.parent))
     try:
         if archive.name.endswith(".zip"):
@@ -231,12 +320,75 @@ def requirements_hash():
     return hashlib.sha256((BACKEND / "requirements.txt").read_bytes()).hexdigest()[:16]
 
 
-def setup_main_env(state, gpu, update):
+def python_works(py: Path) -> bool:
+    try:
+        return subprocess.run([str(py), "-c", "import encodings, json, ssl, sqlite3, ctypes"],
+                              capture_output=True, timeout=120).returncode == 0
+    except Exception:
+        return False
+
+
+def env_python_version(env: Path) -> str:
+    try:
+        for line in (env / "pyvenv.cfg").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() in ("version_info", "version"):
+                return ".".join(value.strip().split(".")[:2])
+    except OSError:
+        pass
+    return PY_VERSION
+
+
+def repair_env(label, env: Path, gpu, deep=False) -> bool:
+    """Check an environment and reinstall only damaged packages. False = rebuild it."""
+    py = env_python(env)
+    if not py.exists():
+        return False
+    uv = uv_bin()
+    if not python_works(py):
+        say(f"    The private Python used by {label} is damaged - reinstalling it")
+        subprocess.run([uv, "python", "install", "--reinstall", env_python_version(env)])
+        if not python_works(py):
+            return False
+    integ = integrity()
+    if not integ:
+        return True
+    if deep:
+        say(f"    Checking every file of {label} (after an interrupted run; takes a minute)...")
+    broken = integ.check_env(env, deep=deep)
+    if not broken:
+        return True
+    names = ", ".join(b["name"] for b in broken[:8]) + (" ..." if len(broken) > 8 else "")
+    say(f"    {len(broken)} damaged or incomplete package(s) in {label}: {names}")
+    say("    Reinstalling just those (from the local download cache when possible)")
+    cmd = [uv, "pip", "install", "--python", str(py), "--no-deps"]
+    for b in broken:
+        cmd += ["--reinstall-package", b["name"]]
+    cmd += [b["requirement"] for b in broken]
+    if torch_index(gpu):
+        cmd += ["--extra-index-url", torch_index(gpu), "--index-strategy", "unsafe-best-match"]
+    subprocess.run(cmd)
+    still = integ.check_env(env, deep=deep)
+    if still:
+        say(f"    Could not repair {', '.join(b['name'] for b in still[:5])}.")
+        return False
+    say(f"    Repaired {label}.")
+    return True
+
+
+def setup_main_env(state, gpu, update, deep=False):
     py = env_python(MAIN_ENV)
     want = {"reqs": requirements_hash(), "torch": torch_index(gpu) or "pypi"}
     if py.exists() and state.get("main_env") == want and not update:
-        return
+        if repair_env("the app environment", MAIN_ENV, gpu, deep):
+            end_step(state, "main_env")
+            return
+        say("    Rebuilding the app environment (cached downloads are reused)")
+        shutil.rmtree(MAIN_ENV, ignore_errors=True)
+        state.pop("main_env", None)
+        deep = False
     uv = uv_bin()
+    begin_step(state, "main_env")
     step("Setting up the app's Python environment (first run downloads ~3 GB, later runs skip this)")
     run([uv, "venv", "--allow-existing", "--relocatable", "--python", PY_VERSION, MAIN_ENV])
     torch_cmd = [uv, "pip", "install", "--python", py, "torch==2.8.0", "torchvision==0.23.0", "torchaudio==2.8.0"]
@@ -247,8 +399,12 @@ def setup_main_env(state, gpu, update):
          "--override", write_override(["torch==2.8.0", "torchvision==0.23.0", "torchaudio==2.8.0"])]
         + (["--extra-index-url", torch_index(gpu), "--index-strategy", "unsafe-best-match"] if torch_index(gpu) else [])
         + (["--upgrade"] if update else []))
+    # packages already present from an interrupted run are skipped by uv, so check they are whole
+    if not repair_env("the app environment", MAIN_ENV, gpu, deep):
+        fail("The app's Python environment is damaged and could not be repaired. Delete the folder "
+             "runtime/envs/main and run the start script again.")
     state["main_env"] = want
-    save_state(state)
+    end_step(state, "main_env")
 
 
 def write_override(lines):
@@ -276,11 +432,29 @@ def llama_asset_patterns(gpu):
     return [r"llama-.*-bin-ubuntu-x64\.tar\.gz$"], None
 
 
+def llama_works(exe_name) -> bool:
+    exe = next(LLAMA_DIR.rglob(exe_name), None) if LLAMA_DIR.exists() else None
+    if not exe:
+        return False
+    try:
+        out = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=60,
+                             cwd=str(exe.parent))
+        return out.returncode == 0 or "version" in (out.stdout + out.stderr).lower()
+    except Exception:
+        return False
+
+
 def setup_llama(state, gpu, update):
     exe = "llama-server.exe" if IS_WIN else "llama-server"
     installed = LLAMA_DIR.exists() and any(LLAMA_DIR.rglob(exe))
+    if installed and not llama_works(exe):
+        say("\n    The LLM runtime (llama.cpp) is damaged or incomplete - reinstalling it")
+        installed = False
+        state.pop("llama_tag", None)
     if installed and not update:
+        end_step(state, "llama")
         return
+    begin_step(state, "llama")
     step("Downloading the LLM runtime (llama.cpp) for your hardware")
     try:
         req = urllib.request.Request("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest",
@@ -289,33 +463,53 @@ def setup_llama(state, gpu, update):
     except Exception as e:
         if installed:
             say(f"    Could not check for updates ({e}); keeping the installed runtime.")
+            end_step(state, "llama")
             return
         fail(f"Could not reach GitHub to download llama.cpp: {e}")
     if installed and release["tag_name"] == state.get("llama_tag"):
         say(f"    Already up to date ({release['tag_name']}).")
+        end_step(state, "llama")
         return
     names = {a["name"]: a["browser_download_url"] for a in release["assets"]}
+    meta = {a["name"]: a for a in release["assets"]}
+
+    def fetch(name):
+        digest = meta[name].get("digest") or ""
+        return download(names[name], tmp / name, size=meta[name].get("size"),
+                        sha256=digest[7:] if digest.startswith("sha256:") else None)
+
     patterns, cudart = llama_asset_patterns(gpu)
     asset = next((n for p in patterns for n in names if re.search(p, n)), None)
     if not asset:
         fail(f"No llama.cpp build found for this system in release {release['tag_name']}.")
     say(f"    Release {release['tag_name']}: {asset}")
     tmp = CACHE / "downloads"
-    if LLAMA_DIR.exists():
-        shutil.rmtree(LLAMA_DIR)
-    extract(download(names[asset], tmp / asset), LLAMA_DIR)
+    # Build the new runtime next to the old one and swap at the end, so an interruption
+    # never leaves a half-extracted runtime in place.
+    staging = RUNTIME / "llama.new"
+    shutil.rmtree(staging, ignore_errors=True)
+    extract(fetch(asset), staging)
     if cudart and "cuda" in asset:
         extra = next((n for n in names if re.search(cudart, n)), None)
         if extra:
-            extract(download(names[extra], tmp / extra), LLAMA_DIR)
-    shutil.rmtree(tmp, ignore_errors=True)
+            extract(fetch(extra), staging)
     if not IS_WIN:
-        for f in LLAMA_DIR.rglob("*"):
+        for f in staging.rglob("*"):
             if f.is_file() and (f.name.startswith("llama-") or f.suffix in (".so", ".dylib")):
                 f.chmod(f.stat().st_mode | 0o755)
+    old = RUNTIME / "llama.old"
+    shutil.rmtree(old, ignore_errors=True)
+    if LLAMA_DIR.exists():
+        LLAMA_DIR.rename(old)
+    staging.rename(LLAMA_DIR)
+    shutil.rmtree(old, ignore_errors=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+    if not llama_works(exe):
+        say("    [!] The new LLM runtime did not start a self-test. If the app can't load a model, "
+            "run the start script with --repair.")
     state["llama_tag"] = release["tag_name"]
     state["llama_asset"] = asset
-    save_state(state)
+    end_step(state, "llama")
 
 
 def relocate_envs(state):
@@ -433,22 +627,113 @@ def choose_assets(state, gpu, force):
     save_state(state)
 
 
-def install_assets(state):
+def repair_engines(gpu, deep_ids=(), deep_all=False):
+    """Check every installed voice engine; reinstall damaged packages, or the whole engine."""
+    envs = RUNTIME / "envs"
+    if not envs.exists():
+        return
+    for env in sorted(p for p in envs.iterdir() if p.is_dir() and p.name != "main"):
+        if not (env / ".installed").exists():
+            continue  # never finished installing: the next install from the app resumes it
+        if repair_env(f"the {env.name} voice engine", env, gpu, deep_all or env.name in deep_ids):
+            continue
+        say(f"    Reinstalling the {env.name} voice engine from scratch")
+        shutil.rmtree(env, ignore_errors=True)
+        if backend_tool("engine", env.name) != 0:
+            say(f"    [!] {env.name} could not be reinstalled; use the Voice page to try again.")
+
+
+def install_assets(state, deep=False):
+    """Idempotent: each run only does what is still missing, and resumes partial work."""
     assets = state.get("assets", {})
-    if assets.get("voice") not in (None, "skip", "api") and not state.get("voice_done"):
-        step(f"Installing the voice engine ({assets['voice']}) - several minutes, downloads a few GB")
-        if backend_tool("engine", assets["voice"]) == 0:
+    voice, llm = assets.get("voice"), assets.get("llm")
+    if voice not in (None, "skip", "api") and not state.get("voice_done"):
+        begin_step(state, "voice")
+        step(f"Installing the voice engine ({voice}) - several minutes, downloads a few GB")
+        if backend_tool("engine", voice) == 0:
             state["voice_done"] = True
-            save_state(state)
+            end_step(state, "voice")
         else:
-            say("    Voice engine install failed; you can retry from the Voice page.")
-    if assets.get("llm") not in (None, "skip", "api") and not state.get("llm_done"):
-        step("Downloading the language model (resumes if interrupted)")
-        if backend_tool("model", assets["llm"]) == 0:
+            say("    Voice engine install did not finish; the next start continues it (or use the Voice page).")
+    if llm not in (None, "skip", "api") and (not state.get("llm_done") or deep):
+        done = state.get("llm_done")
+        begin_step(state, "llm")
+        step("Checking the language model" if done else "Downloading the language model (resumes if interrupted)")
+        # --verify re-hashes an existing download and only fetches it again if it is damaged;
+        # it never changes which model is selected in the app.
+        if backend_tool("model", llm, *(["--verify"] if done else [])) == 0:
             state["llm_done"] = True
-            save_state(state)
+            end_step(state, "llm")
         else:
             say("    Model download did not finish; it resumes next start, or use the Brain page.")
+
+
+# ---------------------------------------------------------------------------- app files
+
+def repair_app_files(state, deep=False):
+    """Compare the app's own files with launcher/manifest.json (written into the release zip)
+    and put back anything missing or damaged from the matching release download."""
+    manifest_file = ROOT / "launcher" / "manifest.json"
+    if not manifest_file.exists():
+        return  # source checkout: git keeps these files
+    try:
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        say("    [!] launcher/manifest.json is damaged; skipping the app-file check.")
+        return
+    integ = integrity()
+    if integ:
+        bad = integ.check_app_files(ROOT, manifest, deep=deep)
+    else:  # integrity.py itself is gone: a size check needs no helper
+        bad = [rel for rel, m in manifest["files"].items()
+               if not rel.startswith(("backend/services/Character/", "backend/services/TTS/GPTsovits/models/"))
+               and rel not in ("backend/settings.json", "Start Windows.bat", "Start Mac.command", "Start Linux.sh")
+               and (not (ROOT / rel).is_file() or (ROOT / rel).stat().st_size != m["size"])]
+    if not bad:
+        end_step(state, "app_files")
+        return
+    step(f"{len(bad)} app file(s) are missing or damaged - restoring them")
+    for rel in bad[:10]:
+        say(f"    - {rel}")
+    if len(bad) > 10:
+        say(f"    ... and {len(bad) - 10} more")
+    version, repo = manifest.get("version"), manifest.get("repo")
+    if not version or not repo:
+        fail("Re-download the app zip and copy your runtime/ and cache/ folders into it.")
+    begin_step(state, "app_files")
+    name = f"LocalAIVtuber-v{version}.zip"
+    zip_path = CACHE / "downloads" / name
+    try:
+        download(f"https://github.com/{repo}/releases/download/v{version}/{name}", zip_path, label=name)
+        with zipfile.ZipFile(zip_path) as z:
+            members = {n.split("/", 1)[1]: n for n in z.namelist() if "/" in n}
+            for rel in bad:
+                if rel not in members:
+                    continue
+                dest = ROOT / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dest.with_name(dest.name + ".restore")
+                with z.open(members[rel]) as src, open(tmp, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                os.replace(tmp, dest)
+    except Exception as e:
+        # Keep going: the app may still start. The step stays marked, so the next start tries again.
+        say(f"    [!] Could not restore them right now ({e}).")
+        say("        The next start tries again. If the app misbehaves, re-download the app zip and copy your")
+        say("        runtime/ and cache/ folders into the new folder (nothing has to be downloaded twice).")
+        return
+    integ = integrity() or integ  # may have just been restored itself
+    still = integ.check_app_files(ROOT, manifest, deep=True) if integ else []
+    still = [r for r in still if r in bad]
+    zip_path.unlink(missing_ok=True)
+    if still:
+        say(f"    [!] {len(still)} file(s) could not be restored (e.g. {still[0]}); the next start tries again.")
+        return
+    say(f"    Restored {len(bad)} file(s).")
+    end_step(state, "app_files")
+    if any(r.startswith("launcher/") for r in bad):
+        say("    The launcher itself was repaired - starting again with the fixed version.")
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 # ---------------------------------------------------------------------------- shortcuts
@@ -607,7 +892,8 @@ def open_window():
     return None
 
 
-def start_app(no_window=False):
+def start_app(no_window=False, retry_ok=False):
+    """Returns False when the server crashed during startup and a repair pass may help."""
     if server_alive():
         say("The app is already running - opening its window.")
         if not no_window:
@@ -638,6 +924,8 @@ def start_app(no_window=False):
 
     for _ in range(240):
         if server.poll() is not None:
+            if retry_ok:
+                return False
             fail("The app server stopped during startup. See the messages above.")
         if server_alive():
             break
@@ -666,6 +954,7 @@ def start_app(no_window=False):
     else:
         say("    Opened in your browser. Use Quit in the app (or close this window) to stop everything.")
         server.wait()
+    return True
 
 
 def main():
@@ -673,27 +962,50 @@ def main():
     parser.add_argument("--update", action="store_true", help="update the LLM runtime and Python packages")
     parser.add_argument("--setup", action="store_true", help="choose the model and voice engine again")
     parser.add_argument("--no-window", action="store_true", help="do not open the app window")
+    parser.add_argument("--repair", action="store_true", help="re-check every file byte-for-byte and fix damage")
     parser.add_argument("--install-only", action="store_true", help="set everything up but do not start")
     parser.add_argument("--started-by", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     say(f"{APP_NAME} - folder: {ROOT}")
+    if server_alive() and not (args.update or args.setup or args.repair or args.install_only):
+        # Started twice: don't touch files the running app is using, just show it.
+        say("The app is already running - opening its window.")
+        if not args.no_window:
+            open_window()
+        return
     for d in (RUNTIME, CACHE):
         d.mkdir(parents=True, exist_ok=True)
     state = load_state()
     if args.setup:
         state.pop("voice_done", None)
         state.pop("llm_done", None)
+    interrupted = set(unfinished_steps(state))
+    if interrupted:
+        what = " and ".join(STEP_NAMES.get(s, s) for s in sorted(interrupted))
+        say(f"\n    Last time, setup stopped while {what}.")
+        say("    Continuing from there and double-checking those files.")
+    deep_all = args.repair
+    if deep_all:
+        step("Repair: checking every installed file")
     relocate_envs(state)
     tidy_start_scripts()
+    repair_app_files(state, deep=deep_all or "app_files" in interrupted)
     gpu = detect_gpu()
     setup_frontend()
-    setup_main_env(state, gpu, args.update)
+    setup_main_env(state, gpu, args.update, deep=deep_all or "main_env" in interrupted)
     setup_llama(state, gpu, args.update)
     choose_assets(state, gpu, args.setup)
-    install_assets(state)
+    install_assets(state, deep=deep_all or "llm" in interrupted)
+    voice = state.get("assets", {}).get("voice")
+    repair_engines(gpu, deep_ids=(voice,) if "voice" in interrupted else (), deep_all=deep_all)
     create_shortcuts(state)
-    if not args.install_only:
+    if args.install_only:
+        return
+    if not start_app(args.no_window, retry_ok=True):
+        step("The app crashed while starting - checking every file for damage, then trying again")
+        repair_app_files(state, deep=True)
+        setup_main_env(state, gpu, False, deep=True)
         start_app(args.no_window)
 
 

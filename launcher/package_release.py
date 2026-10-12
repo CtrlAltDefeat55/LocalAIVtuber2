@@ -4,6 +4,9 @@ Contains the tracked source, the prebuilt web UI (so users never need Node.js),
 the start scripts and icons. Runtimes and models are fetched on first start.
 """
 import argparse
+import importlib.util
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -19,6 +22,15 @@ EXECUTABLE = {"Start Linux.sh", "Start Mac.command"}
 def version():
     m = re.search(r'APP_VERSION = "([^"]+)"', (ROOT / "backend" / "server.py").read_text(encoding="utf-8"))
     return m.group(1) if m else "dev"
+
+
+def github_repo():
+    """owner/name used to fetch replacement files; from Actions, or the git remote."""
+    if os.environ.get("GITHUB_REPOSITORY"):
+        return os.environ["GITHUB_REPOSITORY"]
+    url = subprocess.run(["git", "remote", "get-url", "origin"], cwd=ROOT, capture_output=True, text=True).stdout
+    m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?\s*$", url)
+    return m.group(1) if m else ""
 
 
 def main():
@@ -44,6 +56,12 @@ def main():
     out_dir = ROOT / "dist"
     out_dir.mkdir(exist_ok=True)
     out = out_dir / f"{TOP}-v{version()}.zip"
+    # Size + SHA-256 of every shipped file, so the launcher can find and restore damaged ones.
+    spec = importlib.util.spec_from_file_location("integrity", ROOT / "backend/services/lib/integrity.py")
+    integrity = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(integrity)
+    manifest = integrity.build_manifest(ROOT, files, version(), github_repo())
+    files = [f for f in files if f != "launcher/manifest.json"]
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for rel in sorted(set(files)):
             src = ROOT / rel
@@ -55,6 +73,7 @@ def main():
             info.compress_type = zipfile.ZIP_DEFLATED
             with open(src, "rb") as fh:
                 z.writestr(info, fh.read())
+        z.writestr(f"{TOP}/launcher/manifest.json", json.dumps(manifest, indent=1))
     print(f"Wrote {out} ({out.stat().st_size / 1e6:.1f} MB, {len(files)} files)")
 
 

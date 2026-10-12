@@ -2,6 +2,7 @@
 
   python tools/setup_assets.py engine chatterbox     install a voice engine
   python tools/setup_assets.py model <model_id>      download a language model and select it
+  python tools/setup_assets.py model <id> --verify   re-check a downloaded model; re-fetch damaged parts
   python tools/setup_assets.py models                list catalog models as JSON
   python tools/setup_assets.py hardware [--json]     scan this PC and recommend models
 """
@@ -64,24 +65,44 @@ def install_engine(engine_id: str) -> int:
     return 0
 
 
-async def _download_model(model_id: str) -> int:
+async def _download_model(model_id: str, verify: bool = False) -> int:
     from services.LLM.LLM import LLM
     from services.LLM.routes import resolve_files, start_download
+    from services.lib.integrity import sha256_file
 
     llm = LLM()
     model = llm.get_model(model_id)
     if not model:
         print(f"Unknown model {model_id}")
         return 2
-    set_setting("llm.model_id", model["id"])
-    if model["file_exists"]:
+    if not verify:
+        set_setting("llm.model_id", model["id"])
+    if model["file_exists"] and not verify:
         print(f"{model['displayName']} is already downloaded.")
         return 0
     try:
         files, local = await resolve_files(model)
     except Exception as e:
+        if verify and model["file_exists"]:
+            print(f"  Could not reach Hugging Face to check the model ({e}); keeping it as is.")
+            return 0
         print(f"Could not find the model files on Hugging Face: {e}")
         return 1
+    if verify:
+        for f in files:
+            if not f.dest.exists():
+                continue
+            if f.size and f.dest.stat().st_size != f.size:
+                print(f"  {f.dest.name}: wrong size - downloading it again")
+                f.dest.unlink()
+            elif f.sha256:
+                print(f"  Checking {f.dest.name} ...", flush=True)
+                if sha256_file(f.dest) != f.sha256:
+                    print(f"  {f.dest.name} is damaged - downloading it again")
+                    f.dest.unlink()
+        if all(f.dest.exists() for f in files):
+            print(f"  {model['displayName']} is intact.")
+            return 0
     job = start_download(llm, model, files, local)
     while job.status in ("starting", "downloading"):
         d = job.to_dict()
@@ -134,7 +155,7 @@ def main():
     if cmd == "engine":
         return install_engine(sys.argv[2])
     if cmd == "model":
-        return asyncio.run(_download_model(sys.argv[2]))
+        return asyncio.run(_download_model(sys.argv[2], verify="--verify" in sys.argv))
     if cmd == "hardware":
         return hardware_report("--json" in sys.argv)
     if cmd == "models":

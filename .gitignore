@@ -12,3 +12,8 @@ backend/services/Memory/chat_sessions/
 .DS_Store
 __pycache__/
 *.pyc
+backend/settings.json.bak
+backend/settings.json.tmp
+backend/settings.json.damaged
+# written into the release zip by launcher/package_release.py
+launcher/manifest.json

@@ -127,6 +127,19 @@ backend/settings.json                  your settings
 
 No log files are written; recent output is kept in memory and visible in the app (e.g. **Voice → ⋯ → Show log**). If you move or rename the folder, the next start updates its internal paths and the desktop shortcut automatically.
 
+## If setup is interrupted or files get damaged
+
+You never have to start over. Close the window, lose power or internet halfway: just run the start script again.
+
+- **Resumes where it stopped.** Each setup step is recorded when it starts and finishes; finished steps are skipped, and big downloads (Python packages, llama.cpp, models) continue from the last byte instead of restarting.
+- **Checks every start.** The app's own files, every installed Python package, the LLM runtime and the setup tool are checked against their recorded sizes. Anything missing or damaged is replaced, and only that: one broken package is reinstalled, not the whole environment.
+- **Deeper check after a crash.** For a step that was interrupted, or if the app crashes while starting, every file is checked byte-for-byte (SHA-256) and fixed, then the app starts again automatically.
+- **Downloads are verified.** Models and llama.cpp are checked against the checksums published by Hugging Face / GitHub; a corrupted download is thrown away and fetched again.
+- **Settings are safe.** `settings.json` is written atomically with a backup copy; if it is ever damaged, your last saved settings are restored.
+- **Force a full check** any time: run the start script with `--repair` (e.g. `"Start Windows.bat" --repair`).
+
+Your own data (settings, characters, voices, downloaded models) is never overwritten by a repair.
+
 ## Troubleshooting
 
 - **"The LLM runtime is missing"**: run your start script with `--update` (e.g. `"Start Windows.bat" --update`).

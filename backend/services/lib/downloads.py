@@ -17,6 +17,7 @@ from urllib.parse import quote
 import aiohttp
 
 from .LAV_logger import logger
+from .integrity import sha256_file
 from .paths import hf_token
 
 HF_BASE = "https://huggingface.co"
@@ -33,7 +34,7 @@ def hf_file_url(repo: str, path: str, revision: str = "main") -> str:
 
 
 async def hf_list_files(repo: str) -> List[dict]:
-    """Return [{'path', 'size'}] for every file in a model repo (recursive)."""
+    """Return [{'path', 'size', 'sha256'}] for every file in a model repo (recursive)."""
     url = f"{HF_BASE}/api/models/{repo}/tree/main?recursive=true"
     files = []
     async with aiohttp.ClientSession(headers=hf_headers()) as session:
@@ -47,8 +48,9 @@ async def hf_list_files(repo: str) -> List[dict]:
                 resp.raise_for_status()
                 for item in await resp.json():
                     if item.get("type") == "file":
-                        size = (item.get("lfs") or {}).get("size") or item.get("size") or 0
-                        files.append({"path": item["path"], "size": size})
+                        lfs = item.get("lfs") or {}
+                        size = lfs.get("size") or item.get("size") or 0
+                        files.append({"path": item["path"], "size": size, "sha256": lfs.get("oid")})
                 url = resp.links.get("next", {}).get("url") if resp.links else None
     return files
 
@@ -102,6 +104,7 @@ class DownloadFile:
     url: str
     dest: Path
     size: int = 0
+    sha256: Optional[str] = None  # checked after download when Hugging Face publishes it
 
 
 @dataclass
@@ -238,6 +241,12 @@ class DownloadManager:
                         job.downloaded = done_before + have
         if f.size and have != f.size:
             raise RuntimeError(f"Incomplete download of {f.dest.name} ({have} of {f.size} bytes); retry to resume")
+        if f.sha256:
+            job.current_file = f"Checking {f.dest.name}"
+            if await asyncio.to_thread(sha256_file, part) != f.sha256:
+                part.unlink(missing_ok=True)
+                raise RuntimeError(f"{f.dest.name} was corrupted during download and has been discarded; "
+                                   "retry to download it again")
         os.replace(part, f.dest)
 
 

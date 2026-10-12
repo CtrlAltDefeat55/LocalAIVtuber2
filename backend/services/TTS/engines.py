@@ -19,6 +19,7 @@ from typing import Optional
 import httpx
 
 from services.lib.LAV_logger import logger
+from services.lib.integrity import check_env
 from services.lib.paths import BACKEND_DIR, ENGINE_ENVS_DIR, TTS_ENGINE_SCRIPT, UV_BIN_DIR, hf_token
 from services.lib.process_manager import process_manager
 
@@ -255,6 +256,11 @@ class EngineManager:
                 cmd += ["--extra-index-url", gpu["index"], "--index-strategy", "unsafe-best-match"]
             self._run(engine_id, cmd)
 
+            # A previous run that was killed mid-copy can leave half-written packages that uv
+            # considers installed; find and replace exactly those.
+            self.step[engine_id] = "Checking installed files"
+            self._repair_packages(engine_id, uv, gpu)
+
             if spec.get("post_install"):
                 self._run(engine_id, [py, *spec["post_install"]])
 
@@ -278,6 +284,31 @@ class EngineManager:
         finally:
             self._install_procs.pop(engine_id, None)
 
+    def _repair_packages(self, engine_id: str, uv: str, gpu: Optional[dict] = None, deep: bool = False):
+        """Reinstall only the packages whose files are missing or damaged. Raises if that fails."""
+        spec = ENGINES[engine_id]
+        env_dir = ENGINE_ENVS_DIR / engine_id
+        broken = check_env(env_dir, deep=deep)
+        if not broken:
+            return
+        gpu = gpu or detect_gpu()
+        names = ", ".join(b["name"] for b in broken[:6])
+        self.logs[engine_id].append(f"Repairing {len(broken)} damaged package(s): {names}")
+        logger.warning(f"{engine_id}: repairing damaged packages: {names}")
+        cmd = [uv, "pip", "install", "--python", env_python(engine_id), "--no-deps"]
+        for b in broken:
+            cmd += ["--reinstall-package", b["name"]]
+        cmd += [b["requirement"] for b in broken]
+        for link in spec.get("find_links", []):
+            cmd += ["--find-links", link]
+        if gpu.get("index"):
+            cmd += ["--extra-index-url", gpu["index"], "--index-strategy", "unsafe-best-match"]
+        self._run(engine_id, cmd)
+        still = check_env(env_dir, deep=deep)
+        if still:
+            raise RuntimeError(f"These packages are still damaged: {', '.join(b['name'] for b in still[:6])}. "
+                               "Use Reinstall on the Voice page.")
+
     def uninstall(self, engine_id: str):
         self.stop(engine_id)
         shutil.rmtree(ENGINE_ENVS_DIR / engine_id, ignore_errors=True)
@@ -299,6 +330,13 @@ class EngineManager:
                 and self.state.get(engine_id) == "ready"):
             return
         self.state[engine_id], self.errors[engine_id] = "starting", None
+        uv = find_uv()
+        if uv:
+            try:  # quick size check of every package file; repairs in place if something is broken
+                self._repair_packages(engine_id, uv)
+            except Exception as e:
+                self.state[engine_id], self.errors[engine_id] = "error", str(e)
+                raise RuntimeError(str(e))
         port = _free_port()
         cmd = [env_python(engine_id), TTS_ENGINE_SCRIPT, "--engine", engine_id, "--port", port, "--device", device]
         if variant:

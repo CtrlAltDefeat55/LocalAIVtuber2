@@ -428,3 +428,67 @@ class UsageAttribution(unittest.TestCase):
         # AMD: counters are the only source; total VRAM comes from the hardware scan
         amd = m._apply_windows_counters([], groups, [{"name": "Radeon RX 7800 XT", "vram_gb": 16}])[0]
         self.assertEqual((amd["name"], amd["vram_total_gb"], round(amd["vram_used_gb"])), ("Radeon RX 7800 XT", 16, 9))
+
+
+class Integrity(unittest.TestCase):
+    """Damaged installs are found precisely so only they get reinstalled / restored."""
+
+    def _fake_env(self, root: Path):
+        import base64
+        import hashlib
+        sp = root / "lib" / "python3.11" / "site-packages"
+        (sp / "demo").mkdir(parents=True)
+        body = b"print('hello')\n"
+        (sp / "demo" / "__init__.py").write_bytes(body)
+        digest = base64.urlsafe_b64encode(hashlib.sha256(body).digest()).rstrip(b"=").decode()
+        info = sp / "demo-1.2.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text("Metadata-Version: 2.1\nName: demo\nVersion: 1.2\n\n")
+        (info / "direct_url.json").write_text(json.dumps({"url": "https://example.com/demo.zip", "archive_info": {}}))
+        (info / "RECORD").write_text(f"demo/__init__.py,sha256={digest},{len(body)}\n"
+                                     f"../../../bin/demo,sha256=XXXX,1\ndemo-1.2.dist-info/RECORD,,\n")
+        return sp
+
+    def test_env_quick_and_deep(self):
+        from services.lib.integrity import check_env
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = self._fake_env(Path(tmp))
+            self.assertEqual(check_env(Path(tmp), deep=True), [])  # scripts outside site-packages are ignored
+            f = sp / "demo" / "__init__.py"
+            f.write_bytes(b"print('hellO')\n")  # same size, different bytes
+            self.assertEqual(check_env(Path(tmp)), [])
+            broken = check_env(Path(tmp), deep=True)
+            self.assertEqual(broken[0]["requirement"], "demo @ https://example.com/demo.zip")
+            f.unlink()
+            self.assertIn("missing demo/__init__.py", check_env(Path(tmp))[0]["problems"])
+
+    def test_app_files_skip_user_data(self):
+        from services.lib.integrity import build_manifest, check_app_files
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel in ("backend/server.py", "backend/settings.json", "Start Linux.sh",
+                        "backend/services/Character/VRM3D/models/a.vrm"):
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text("x")
+            manifest = build_manifest(root, ["backend/server.py", "backend/settings.json", "Start Linux.sh",
+                                             "backend/services/Character/VRM3D/models/a.vrm"], "1.0")
+            for rel in ("backend/settings.json", "Start Linux.sh", "backend/services/Character/VRM3D/models/a.vrm"):
+                (root / rel).unlink()
+            (root / "backend/server.py").write_text("y")
+            self.assertEqual(check_app_files(root, manifest), [])
+            self.assertEqual(check_app_files(root, manifest, deep=True), ["backend/server.py"])
+
+
+class SettingsRecovery(unittest.TestCase):
+    def test_damaged_settings_restored_from_backup(self):
+        import importlib
+        server = importlib.import_module("server")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            mgr = server.SettingsManager(path)
+            mgr.save_settings({"a": 1})
+            mgr.save_settings({"a": 2})  # previous version becomes the backup
+            path.write_text('{"a": 3', encoding="utf-8")  # half-written / damaged
+            self.assertEqual(server.SettingsManager(path).settings, {"a": 1})
+            self.assertTrue((Path(tmp) / "settings.json.damaged").exists())
+            self.assertEqual(json.loads(path.read_text()), {"a": 1})
