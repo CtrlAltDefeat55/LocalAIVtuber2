@@ -6,6 +6,8 @@ export type EngineState = "not_installed" | "installing" | "stopped" | "starting
 export interface SystemStatus {
   version: string
   llm: {
+    provider: "local" | "remote"
+    remote?: { preset: string; base_url: string; model: string; has_key: boolean }
     state: LLMState
     error: string | null
     runtime_installed: boolean
@@ -16,7 +18,8 @@ export interface SystemStatus {
     vision_active: boolean
     options: Record<string, unknown>
   }
-  tts: { active_engine: string; current_voice: string | null; state: EngineState; error: string | null }
+  /** source "local" = engines on this PC; otherwise a remote voice service (voicebox, openai, elevenlabs) */
+  tts: { source: string; active_engine: string; current_voice: string | null; state: EngineState; error: string | null }
   gpu: { kind: string; name?: string }
   platform: string
 }

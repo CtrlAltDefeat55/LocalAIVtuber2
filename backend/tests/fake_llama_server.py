@@ -22,10 +22,16 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        self._send(200, {"status": "ok"}) if self.path == "/health" else self._send(404, {})
+        if self.path == "/health":
+            return self._send(200, {"status": "ok"})
+        if self.path == "/v1/models":  # LM Studio / OpenAI-style model list
+            return self._send(200, {"data": [{"id": "qwen3.8-27b"}, {"id": "gemma-4-12b"}]})
+        self._send(404, {})
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if "--require-key" in sys.argv and self.headers.get("Authorization") != "Bearer sk-test":
+            return self._send(401, {"error": "bad key"})
         if self.path == "/apply-template":
             return self._send(200, {"prompt": "<prompt>" + "|".join(m["content"] for m in req["messages"])})
         self.send_response(200)

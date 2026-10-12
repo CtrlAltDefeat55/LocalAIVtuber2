@@ -26,7 +26,7 @@ const PANEL_KEY = "lav.character.panel"
 
 type Kind = "live2d" | "vrm"
 
-export function CharacterRender() {
+export function CharacterRender({ isActive = true }: { isActive?: boolean }) {
   const { settings, updateSetting } = useSettings()
   const [live2DModels, setLive2DModels] = useState<CharacterModel[]>([])
   const [vrmModels, setVrmModels] = useState<CharacterModel[]>([])
@@ -156,8 +156,8 @@ export function CharacterRender() {
       >
         {show && selectedPath && selectedExists ? (
           kind === "live2d"
-            ? <Live2DCanvas modelPath={selectedPath} xPosition={Number(x)} yPosition={Number(y)} scale={Number(scale)} />
-            : <VRM3dCanvas modelPath={selectedPath} key={selectedPath} />
+            ? <Live2DCanvas modelPath={selectedPath} xPosition={Number(x)} yPosition={Number(y)} scale={Number(scale)} paused={!isActive} />
+            : <VRM3dCanvas modelPath={selectedPath} key={selectedPath} paused={!isActive} />
         ) : (
           <div className="grid h-full place-items-center p-8 text-center">
             <div className="max-w-sm space-y-2 text-sm text-muted-foreground">

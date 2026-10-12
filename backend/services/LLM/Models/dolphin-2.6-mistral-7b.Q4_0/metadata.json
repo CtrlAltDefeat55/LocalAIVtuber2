@@ -1,5 +1,5 @@
 {
-    "displayName": "dolphin-2.6-mistral-7b",
+    "displayName": "Dolphin 2.6 Mistral 7B (Q4)",
     "description": "General purpose LLM",
     "fileName": "dolphin-2.6-mistral-7b.Q4_0.gguf",
     "link": "https://huggingface.co/TheBloke/dolphin-2.6-mistral-7B-GGUF/resolve/main/dolphin-2.6-mistral-7b.Q4_0.gguf?download=true",
@@ -8,5 +8,6 @@
     "vram_hint": "6 GB",
     "tags": [
         "Small"
-    ]
+    ],
+    "size_gb": 4.1
 }

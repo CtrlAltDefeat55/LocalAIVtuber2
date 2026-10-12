@@ -18,9 +18,13 @@ interface Live2DCanvasProps {
   /** Scale factor relative to the model's native size. */
   scale: number;
   onStatus?: (status: "loading" | "ready" | "error", message?: string) => void;
+  /** Stop drawing frames while the page is hidden. */
+  paused?: boolean;
 }
 
-const Live2DCanvas: React.FC<Live2DCanvasProps> = ({ modelPath, xPosition, yPosition, scale, onStatus }) => {
+const Live2DCanvas: React.FC<Live2DCanvasProps> = ({ modelPath, xPosition, yPosition, scale, onStatus, paused = false }) => {
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
   const containerRef = useRef<HTMLDivElement>(null);
   const appRef = useRef<PIXI.Application | null>(null);
   const modelRef = useRef<Live2DModel | null>(null);
@@ -47,6 +51,7 @@ const Live2DCanvas: React.FC<Live2DCanvasProps> = ({ modelPath, xPosition, yPosi
     const app = new PIXI.Application({ resizeTo: container, backgroundAlpha: 0, antialias: true });
     container.appendChild(app.view as HTMLCanvasElement);
     appRef.current = app;
+    if (pausedRef.current) app.ticker.stop();
     let cancelled = false;
     setError(null);
     onStatus?.("loading");
@@ -91,6 +96,13 @@ const Live2DCanvas: React.FC<Live2DCanvasProps> = ({ modelPath, xPosition, yPosi
   }, [modelPath]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(applyTransform, [xPosition, yPosition, scale]);
+
+  useEffect(() => {
+    const app = appRef.current;
+    if (!app) return;
+    if (paused) app.ticker.stop();
+    else app.ticker.start();
+  }, [paused]);
 
   return (
     <div ref={containerRef} className="relative h-full w-full overflow-hidden">

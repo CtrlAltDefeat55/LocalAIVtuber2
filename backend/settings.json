@@ -11,5 +11,8 @@
     "frontend.character.3d2dSwitch": false,
     "frontend.character.selectedLive2DModel": "/api/character/files/live2D/models/akari_vts/akari.model3.json",
     "frontend.character.selectedVRMModel": "/api/character/files/VRM3D/models/生駒ミル_私服.vrm",
-    "tts.enabled": true
+    "tts.enabled": true,
+    "ui.performanceBar": true,
+    "llm.provider": "local",
+    "tts.source": "local"
 }

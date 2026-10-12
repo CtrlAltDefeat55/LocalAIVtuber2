@@ -18,9 +18,20 @@ const BACKGROUND_IMAGE = "/black.png"
 
 interface VRM3dCanvasProps {
     modelPath?: string;
+    /** Stop drawing frames (page hidden) so the GPU is free for the LLM and other apps. */
+    paused?: boolean;
 }
 
-const VRM3dCanvas: React.FC<VRM3dCanvasProps> = ({ modelPath }) => {
+const VRM3dCanvas: React.FC<VRM3dCanvasProps> = ({ modelPath, paused = false }) => {
+  const pausedRef = useRef(paused);
+  const loopRef = useRef<{ renderer: THREE.WebGLRenderer; animate: () => void } | null>(null);
+  useEffect(() => {
+    pausedRef.current = paused;
+    const loop = loopRef.current;
+    if (!loop) return;
+    clockRef.current?.getDelta(); // don't jump animations forward after a pause
+    loop.renderer.setAnimationLoop(paused ? null : loop.animate);
+  }, [paused]);
   const mountRef = useRef<HTMLDivElement>(null);
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
   const vrmRef = useRef<VRM | null>(null);
@@ -208,7 +219,8 @@ const VRM3dCanvas: React.FC<VRM3dCanvasProps> = ({ modelPath }) => {
         controls.update();
         renderer.render(scene, camera);
       };
-      renderer.setAnimationLoop(animate);
+      loopRef.current = { renderer, animate };
+      if (!pausedRef.current) renderer.setAnimationLoop(animate);
 
     };
     // Size to our own box (it changes with the sidebar, inspector panel and window).
@@ -296,6 +308,7 @@ const VRM3dCanvas: React.FC<VRM3dCanvasProps> = ({ modelPath }) => {
         // Remove event listeners
         resizeObserver.disconnect();
         renderer.setAnimationLoop(null);
+        loopRef.current = null;
         window.removeEventListener('resize', handleResize);
         window.removeEventListener('click', onMouseClick);
 

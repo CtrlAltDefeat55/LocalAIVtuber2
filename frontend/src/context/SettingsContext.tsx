@@ -85,8 +85,9 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
                     new Blob([JSON.stringify({ settings: pending.current })], { type: 'application/json' }));
             }
         };
-        window.addEventListener('beforeunload', onUnload);
-        return () => window.removeEventListener('beforeunload', onUnload);
+        // pagehide (not beforeunload) never delays or blocks closing/reloading the window
+        window.addEventListener('pagehide', onUnload);
+        return () => window.removeEventListener('pagehide', onUnload);
     }, []);
 
     return (

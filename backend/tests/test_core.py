@@ -248,3 +248,183 @@ class LLMServerLifecycle(unittest.TestCase):
                 self.assertEqual(llm.status()["state"], "stopped")
         finally:
             os.environ.pop("LAV_LLAMA_SERVER", None)
+
+
+class RemoteProviders(unittest.TestCase):
+    """LM Studio-style LLM API and a Voicebox-style voice API, exercised over real HTTP."""
+
+    def setUp(self):
+        import socket
+        import subprocess
+        import time
+        import httpx
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+        fake = Path(__file__).resolve().parent / "fake_llama_server.py"
+        self.proc = subprocess.Popen([sys.executable, str(fake), "-m", "x", "--port", str(self.port), "--require-key"],
+                                     stdout=subprocess.DEVNULL)
+        for _ in range(50):
+            try:
+                httpx.get(f"http://127.0.0.1:{self.port}/health", timeout=0.5)
+                break
+            except httpx.HTTPError:
+                time.sleep(0.1)
+
+    def tearDown(self):
+        self.proc.terminate()
+        self.proc.wait()
+
+    def test_remote_llm_lists_models_and_streams_with_key(self):
+        import asyncio
+        from unittest import mock
+        from services.LLM import remote
+        from services.LLM.LLM import LLM
+
+        base = remote.normalize_url(f"127.0.0.1:{self.port}", "lmstudio")
+        self.assertEqual(base, f"http://127.0.0.1:{self.port}/v1")
+        self.assertEqual(asyncio.run(remote.list_models(base, "sk-test")), ["gemma-4-12b", "qwen3.8-27b"])
+
+        llm = LLM()
+        llm.set_remote(preset="lmstudio", base_url=base, model="qwen3.8-27b")
+        llm.set_provider("remote")
+
+        async def collect():
+            return "".join([c async for c in llm.get_completion("hi", [], "sys")])
+
+        with mock.patch("services.LLM.LLM.get_secret", return_value="sk-test"):
+            self.assertEqual(asyncio.run(collect()), "Hello there!")
+            self.assertEqual(llm.status()["state"], "ready")
+        with mock.patch("services.LLM.LLM.get_secret", return_value="wrong"):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(collect())
+            self.assertIn("API key", str(ctx.exception))
+            self.assertEqual(llm.status()["state"], "error")
+
+    def test_unconfigured_remote_explains_itself(self):
+        import asyncio
+        from services.LLM.LLM import LLM
+        llm = LLM()
+        llm.set_provider("remote")
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(llm.ensure_loaded())
+        self.assertIn("Brain page", str(ctx.exception))
+
+    def test_voicebox_profiles_and_generate(self):
+        import asyncio
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from services.TTS import remote
+
+        seen = {}
+
+        class Voicebox(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = json.dumps([{"id": "p1", "name": "Aya", "language": "ja"}]).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                seen.update(json.loads(self.rfile.read(int(self.headers["Content-Length"]))), path=self.path)
+                body = wav_bytes(0.5)
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Voicebox)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = remote.normalize_url(f"127.0.0.1:{server.server_address[1]}", "voicebox")
+        try:
+            voices = asyncio.run(remote.list_voices("voicebox", base, None))
+            self.assertEqual(voices[0]["name"], "Aya")
+            audio, media = asyncio.run(remote.synthesize("voicebox", base, None, "hello", "p1", None, "ja"))
+        finally:
+            server.shutdown()
+        self.assertEqual(media, "audio/wav")
+        self.assertGreater(len(audio), 1000)
+        self.assertEqual((seen["path"], seen["profile_id"], seen["language"]), ("/generate/stream", "p1", "ja"))
+
+
+class HardwareRecommendations(unittest.TestCase):
+    def info(self, gpus, ram=32):
+        return {"ram": {"total_gb": ram}, "gpus": gpus}
+
+    def test_tiers(self):
+        from services.lib.hardware import recommend
+        nv = lambda gb: [{"vendor": "NVIDIA", "name": f"RTX {gb}GB", "vram_gb": gb}]
+        catalog = [{"id": "Qwen3.8-27B-abliterated-IQ3_S", "size_gb": 12.0}, {"id": "Gemma-4-12B-it-Q4", "size_gb": 7.5}]
+        r24 = recommend(self.info(nv(24)), catalog)
+        self.assertEqual((r24["llm"], r24["voice"]), ("Qwen3.8-27B-abliterated-IQ3_S", "chatterbox"))
+        self.assertEqual(r24["model_fits"]["Qwen3.8-27B-abliterated-IQ3_S"]["level"], "great")
+        r16 = recommend(self.info(nv(16)), catalog)
+        self.assertEqual((r16["llm"], r16["voice"]), ("Qwen3.8-27B-abliterated-IQ3_S", "luxtts"))
+        r12 = recommend(self.info(nv(12)), catalog)
+        self.assertEqual(r12["llm"], "Gemma-4-12B-it-Q4")
+        self.assertEqual(r12["model_fits"]["Qwen3.8-27B-abliterated-IQ3_S"]["level"], "ok")  # split GPU/CPU
+        r8 = recommend(self.info(nv(8)), catalog)
+        self.assertEqual(r8["llm"], "Gemma-4-12B-it-Q4")
+        cpu = recommend(self.info([], ram=8), catalog)
+        self.assertEqual((cpu["llm"], cpu["voice"]), ("Aya-7b-gguf", "luxtts"))
+        self.assertEqual(cpu["model_fits"]["Qwen3.8-27B-abliterated-IQ3_S"]["level"], "no")
+        igpu = recommend(self.info([{"vendor": "Intel", "name": "UHD", "vram_gb": 0.1, "integrated": True}]), catalog)
+        self.assertIsNone(igpu["gpu"])  # integrated graphics are not counted as a usable GPU
+        mac = recommend(self.info([{"vendor": "Apple", "name": "M3 Max", "vram_gb": 45, "unified": True}], ram=64), catalog)
+        self.assertEqual((mac["llm"], mac["voice"]), ("Qwen3.8-27B-abliterated-IQ3_S", "chatterbox"))
+
+
+class UsageAttribution(unittest.TestCase):
+    """GPU memory is attributed to the right part of the app, whichever source provides it."""
+
+    def make(self):
+        from services.lib.monitor import UsageMonitor
+        m = UsageMonitor()
+        groups = {"llm": {101, 102}, "voice": {201}, "window": {301}, "app": {1}}
+        return m, groups
+
+    def test_nvml_per_process(self):
+        from types import SimpleNamespace as NS
+        m, groups = self.make()
+
+        class FakeNVML:
+            NVML_TEMPERATURE_GPU = 0
+            def nvmlDeviceGetCount(self): return 1
+            def nvmlDeviceGetHandleByIndex(self, i): return "h"
+            def nvmlDeviceGetName(self, h): return "RTX Test"
+            def nvmlDeviceGetMemoryInfo(self, h): return NS(total=16 * 2**30, used=11 * 2**30)
+            def nvmlDeviceGetUtilizationRates(self, h): return NS(gpu=57)
+            def nvmlDeviceGetTemperature(self, h, k): return 61
+            def nvmlDeviceGetComputeRunningProcesses(self, h): return [NS(pid=102, usedGpuMemory=9 * 2**30), NS(pid=201, usedGpuMemory=None)]
+            def nvmlDeviceGetGraphicsRunningProcesses(self, h): return [NS(pid=301, usedGpuMemory=2**30), NS(pid=999, usedGpuMemory=2**30)]
+
+        m._nvml = FakeNVML()
+        g = m._nvidia(groups, [])[0]
+        self.assertEqual((g["util_pct"], g["temp_c"], g["per_app"]), (57, 61, True))
+        self.assertAlmostEqual(g["by_vram"]["llm"], 9.0)
+        self.assertAlmostEqual(g["by_vram"]["window"], 1.0)
+        self.assertEqual(g["by_vram"]["voice"], 0.0)  # "not available" values are skipped, not counted as huge
+
+    def test_windows_counters_fill_in_and_cover_amd(self):
+        import time
+        from services.lib.monitor import _pid_from
+        m, groups = self.make()
+        self.assertEqual(_pid_from("pid_102_luid_0x0_0x1_phys_0_eng_0_engtype_3D"), 102)
+        self.assertIsNone(_pid_from("luid_0x0_phys_0"))
+        m._win_counters = {"per_pid": {101: {"mem": 6 * 2**30, "util": 40.0}, 201: {"mem": 2**30, "util": 10.0}},
+                           "adapter_used": 9 * 2**30, "total_util": 55.0, "time": time.time()}
+        # NVIDIA under Windows WDDM: NVML had totals but no per-app memory
+        nv = [{"name": "RTX", "vram_total_gb": 12, "vram_used_gb": 9, "util_pct": 55, "temp_c": None,
+               "by_vram": {c: 0.0 for c in ("llm", "voice", "window", "app")}, "by_util": {}, "per_app": False}]
+        g = m._apply_windows_counters(nv, groups, [])[0]
+        self.assertTrue(g["per_app"])
+        self.assertAlmostEqual(g["by_vram"]["llm"], 6.0)
+        self.assertAlmostEqual(g["by_util"]["voice"], 10.0)
+        # AMD: counters are the only source; total VRAM comes from the hardware scan
+        amd = m._apply_windows_counters([], groups, [{"name": "Radeon RX 7800 XT", "vram_gb": 16}])[0]
+        self.assertEqual((amd["name"], amd["vram_total_gb"], round(amd["vram_used_gb"])), ("Radeon RX 7800 XT", 16, 9))

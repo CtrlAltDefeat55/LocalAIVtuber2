@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TOP = "LocalAIVtuber"
-EXECUTABLE = {"start.sh", "start.command"}
+EXECUTABLE = {"Start Linux.sh", "Start Mac.command"}
 
 
 def version():
@@ -51,7 +51,7 @@ def main():
                 continue
             info = zipfile.ZipInfo.from_file(src, f"{TOP}/{rel}")
             mode = 0o755 if Path(rel).name in EXECUTABLE else 0o644
-            info.external_attr = (0o100000 | mode) << 16  # keep start.sh / start.command executable on macOS/Linux
+            info.external_attr = (0o100000 | mode) << 16  # keep the Mac/Linux start scripts executable
             info.compress_type = zipfile.ZIP_DEFLATED
             with open(src, "rb") as fh:
                 z.writestr(info, fh.read())

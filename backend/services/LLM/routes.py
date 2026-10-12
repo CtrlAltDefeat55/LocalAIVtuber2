@@ -13,11 +13,27 @@ from pydantic import BaseModel
 from services.lib.LAV_logger import logger
 from services.lib.downloads import (DownloadFile, download_manager, hf_file_url, hf_list_files, pick_gguf,
                                     pick_mmproj)
+from services.lib.secrets import get_secret, set_secret, storage_name
+from . import remote as remote_api
 from .LLM import LLM
 
 
 class ModelRef(BaseModel):
     model_id: str
+
+
+class RemoteTestRequest(BaseModel):
+    preset: str = "custom"
+    base_url: str
+    api_key: Optional[str] = None  # None = use the saved key
+
+
+class RemoteSaveRequest(BaseModel):
+    preset: str = "custom"
+    base_url: str
+    model: str
+    api_key: Optional[str] = None  # None = keep saved key, "" = remove it
+    use: bool = True
 
 
 class HFRepoRequest(BaseModel):
@@ -84,8 +100,50 @@ def start_download(llm: LLM, model: dict, files, local: dict):
 
 
 
-def create_router(llm: LLM) -> APIRouter:
+def create_router(llm: LLM, persist=None) -> APIRouter:
     router = APIRouter(prefix="/api/llm")
+
+    # ------------------------------------------------------------------ remote API (LM Studio, OpenAI, ...)
+
+    @router.get("/remote")
+    async def remote_info():
+        return {"presets": remote_api.PRESETS, "provider": llm.provider, "remote": llm.remote,
+                "has_key": bool(get_secret("llm.remote")), "key_storage": storage_name()}
+
+    @router.post("/remote/test")
+    async def remote_test(req: RemoteTestRequest):
+        base = remote_api.normalize_url(req.base_url, req.preset)
+        if not base:
+            return JSONResponse(status_code=400, content={"error": "Enter the server address first."})
+        key = req.api_key if req.api_key is not None else get_secret("llm.remote")
+        try:
+            models = await remote_api.list_models(base, key)
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": remote_api.explain(e, base), "base_url": base})
+        return {"base_url": base, "models": models}
+
+    @router.post("/remote")
+    async def remote_save(req: RemoteSaveRequest):
+        if req.api_key is not None:
+            set_secret("llm.remote", req.api_key.strip() or None)
+        values = {"llm.remote.preset": req.preset,
+                  "llm.remote.base_url": remote_api.normalize_url(req.base_url, req.preset),
+                  "llm.remote.model": req.model.strip(),
+                  "llm.provider": "remote" if req.use else "local"}
+        if persist:
+            persist(values)
+        else:
+            llm.set_remote(preset=req.preset, base_url=req.base_url, model=req.model)
+            llm.set_provider(values["llm.provider"])
+        return llm.status()
+
+    @router.post("/provider/local")
+    async def use_local():
+        if persist:
+            persist({"llm.provider": "local"})
+        else:
+            llm.set_provider("local")
+        return llm.status()
 
     def snapshot():
         llm._load_available_models()

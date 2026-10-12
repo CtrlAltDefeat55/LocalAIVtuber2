@@ -1,13 +1,13 @@
 """Local AI VTuber launcher: first-run setup, repair/update, and starting the app.
 
-Started by start.bat (Windows), start.command (macOS) or start.sh (Linux) through
+Started by "Start Windows.bat", "Start Mac.command" or "Start Linux.sh" through
 the bundled `uv`, so it runs on a private Python without anything installed on
 the computer. Uses only the standard library.
 
-  start            install anything missing, then open the app (default)
-  start --update   also update the LLM runtime and Python packages
-  start --setup    re-run the model / voice choices
-  start --no-window  run the server without opening a window (e.g. for OBS only)
+  (no options)     install anything missing, then open the app
+  --update         also update the LLM runtime and Python packages
+  --setup          re-run the hardware check and the model / voice choices
+  --no-window      run the server without opening a window (e.g. for OBS only)
 
 Everything is kept inside this folder (runtime/, cache/), so the folder can be
 moved or renamed; nothing is written to system locations except the optional
@@ -46,6 +46,9 @@ PORT = int(os.environ.get("LAV_PORT", "8000"))
 URL = f"http://127.0.0.1:{PORT}"
 IS_WIN, IS_MAC = sys.platform == "win32", sys.platform == "darwin"
 PY_VERSION = "3.11"
+START_SCRIPTS = {"win32": "Start Windows.bat", "darwin": "Start Mac.command", "linux": "Start Linux.sh"}
+MY_SCRIPT = START_SCRIPTS["win32" if IS_WIN else "darwin" if IS_MAC else "linux"]
+OTHER_SCRIPTS_DIR = ROOT / "Other start scripts"
 
 os.environ.setdefault("UV_PYTHON_INSTALL_DIR", str(RUNTIME / "python"))
 os.environ.setdefault("UV_CACHE_DIR", str(CACHE / "uv"))
@@ -216,7 +219,7 @@ def uv_bin():
             return str(p)
     found = shutil.which("uv")
     if not found:
-        fail("The uv tool is missing. Start the app with start.bat / start.command / start.sh.")
+        fail(f"The uv tool is missing. Start the app with “{MY_SCRIPT}”.")
     return found
 
 
@@ -360,25 +363,70 @@ def backend_tool(*args):
                           cwd=str(BACKEND)).returncode
 
 
+def hardware_scan():
+    """Full scan from the app environment (CPU, RAM, every GPU, blocked probes)."""
+    try:
+        out = subprocess.run([str(env_python(MAIN_ENV)), str(BACKEND / "tools" / "setup_assets.py"), "hardware", "--json"],
+                             cwd=str(BACKEND), capture_output=True, text=True, timeout=120)
+        line = next((l for l in out.stdout.splitlines() if l.startswith("HARDWARE_JSON ")), None)
+        return json.loads(line[len("HARDWARE_JSON "):]) if line else None
+    except Exception as e:
+        say(f"    (Hardware scan failed: {e})")
+        return None
+
+
+def print_hardware(info):
+    cpu, ram = info["cpu"], info["ram"]
+    say(f"    CPU : {cpu['name']} ({cpu['cores']} cores / {cpu['threads']} threads)")
+    say(f"    RAM : {ram['total_gb']:g} GB")
+    for g in info["gpus"] or [{"name": "none detected"}]:
+        mem = f" ({g['vram_gb']:g} GB{' shared' if g.get('unified') else ''})" if g.get("vram_gb") else ""
+        say(f"    GPU : {g['name']}{mem}")
+    if info.get("disk"):
+        say(f"    Disk: {info['disk']['free_gb']:g} GB free")
+    for note in info["notes"]:
+        say(f"    [!] {note}")
+    if info["notes"]:
+        say("    Some details could not be read (see above); the recommendation uses what was found.")
+
+
 def choose_assets(state, gpu, force):
     if state.get("assets_chosen") and not force:
         return
-    step("Choosing your VTuber's brain and voice")
-    vram = gpu["vram_gb"]
-    hw = gpu["name"] or ("Apple Silicon" if gpu["kind"] == "metal" else "no NVIDIA GPU")
-    say(f"    Detected: {hw}" + (f", {vram} GB GPU memory" if vram else ""))
-    default_llm = "Qwen3.8-27B-abliterated-IQ3_S" if vram >= 14 else "Gemma-4-12B-it-Q4"
-    llm = ask("\nWhich language model should be downloaded now?", [
-        ("Qwen3.8-27B-abliterated-IQ3_S", "Qwen3.8 27B Abliterated IQ3_S - best conversation, ~12 GB, fast on 16 GB+ GPUs"),
-        ("Gemma-4-12B-it-Q4", "Gemma 4 12B Q4 - lighter and quicker on 8-12 GB GPUs, ~7.5 GB"),
-        ("skip", "Skip - I'll pick one later on the Brain page"),
+    step("Checking your computer")
+    info = hardware_scan()
+    if info:
+        print_hardware(info)
+        rec = info["recommendation"]
+        default_llm, default_voice = rec["llm"], rec["voice"]
+        say("\n    Recommendation:")
+        for reason in rec["reasons"]:
+            say(f"     - {reason}")
+        fits = rec.get("model_fits", {})
+        vfits = rec.get("voice_fits", {})
+    else:
+        say("    The detailed scan didn't run; using basic GPU detection instead.")
+        vram = gpu["vram_gb"]
+        default_llm = "Qwen3.8-27B-abliterated-IQ3_S" if vram >= 15 else "Gemma-4-12B-it-Q4" if vram >= 6 else "Aya-7b-gguf"
+        default_voice = "chatterbox" if gpu["kind"] in ("cuda", "metal") else "luxtts"
+        fits, vfits = {}, {}
+
+    def fit(mid, table):
+        return f"  [{table[mid]['label']}]" if mid in table else ""
+
+    llm = ask("\nWhich brain (language model) should be downloaded now?", [
+        ("Qwen3.8-27B-abliterated-IQ3_S", "Qwen3.8 27B Abliterated IQ3_S - best conversation, ~12 GB" + fit("Qwen3.8-27B-abliterated-IQ3_S", fits)),
+        ("Gemma-4-12B-it-Q4", "Gemma 4 12B Q4 - quicker on mid-range GPUs, ~7.5 GB" + fit("Gemma-4-12B-it-Q4", fits)),
+        ("Aya-7b-gguf", "Aya 7B - small and light, ~4.4 GB" + fit("Aya-7b-gguf", fits)),
+        ("api", "None - I'll connect LM Studio / Ollama / an online API in the app (Brain page)"),
+        ("skip", "Skip for now"),
     ], default_llm)
-    default_voice = "chatterbox" if gpu["kind"] in ("cuda", "metal") else "luxtts"
     voice = ask("\nWhich voice engine should be installed now?", [
-        ("chatterbox", "Chatterbox Turbo - natural, low latency (English)"),
-        ("luxtts", "LuxTTS - fastest, tiny, works on CPU (English)"),
-        ("omnivoice", "OmniVoice - 600+ languages"),
-        ("skip", "Skip - I'll install one later on the Voice page"),
+        ("chatterbox", "Chatterbox Turbo - natural, low latency (English)" + fit("chatterbox", vfits)),
+        ("luxtts", "LuxTTS - fastest, tiny, works on CPU (English)" + fit("luxtts", vfits)),
+        ("omnivoice", "OmniVoice - 600+ languages" + fit("omnivoice", vfits)),
+        ("api", "None - I'll connect Voicebox / ElevenLabs / another API in the app (Voice page)"),
+        ("skip", "Skip for now"),
     ], default_voice)
     state["assets"] = {"llm": llm, "voice": voice}
     state["assets_chosen"] = True
@@ -387,14 +435,14 @@ def choose_assets(state, gpu, force):
 
 def install_assets(state):
     assets = state.get("assets", {})
-    if assets.get("voice") not in (None, "skip") and not state.get("voice_done"):
+    if assets.get("voice") not in (None, "skip", "api") and not state.get("voice_done"):
         step(f"Installing the voice engine ({assets['voice']}) - several minutes, downloads a few GB")
         if backend_tool("engine", assets["voice"]) == 0:
             state["voice_done"] = True
             save_state(state)
         else:
             say("    Voice engine install failed; you can retry from the Voice page.")
-    if assets.get("llm") not in (None, "skip") and not state.get("llm_done"):
+    if assets.get("llm") not in (None, "skip", "api") and not state.get("llm_done"):
         step("Downloading the language model (resumes if interrupted)")
         if backend_tool("model", assets["llm"]) == 0:
             state["llm_done"] = True
@@ -405,13 +453,47 @@ def install_assets(state):
 
 # ---------------------------------------------------------------------------- shortcuts
 
+def tidy_start_scripts():
+    """Keep only this computer's start script in the app folder; park the others in a subfolder
+    so nobody double-clicks the wrong one. Nothing is deleted - they still work from there."""
+    moved = []
+    for name in START_SCRIPTS.values():
+        src = ROOT / name
+        if name == MY_SCRIPT or not src.exists():
+            continue
+        OTHER_SCRIPTS_DIR.mkdir(exist_ok=True)
+        dest = OTHER_SCRIPTS_DIR / name
+        try:
+            if dest.exists():
+                dest.unlink()
+            shutil.move(str(src), dest)
+            moved.append(name)
+        except OSError as e:
+            say(f"    (Couldn't move {name}: {e})")
+    # an old single "start.*" launcher from earlier versions would also be confusing
+    for legacy in ("start.bat", "start.sh", "start.command"):
+        if (ROOT / legacy).exists() and (ROOT / "launcher" / "launcher.py").exists():
+            OTHER_SCRIPTS_DIR.mkdir(exist_ok=True)
+            try:
+                shutil.move(str(ROOT / legacy), OTHER_SCRIPTS_DIR / legacy)
+                moved.append(legacy)
+            except OSError:
+                pass
+    if moved:
+        readme = OTHER_SCRIPTS_DIR / "README.txt"
+        readme.write_text("These start scripts are for other operating systems. They were moved here so the "
+                          f"app folder only shows “{MY_SCRIPT}”.\nIf you copy this folder to another kind of "
+                          "computer, run the matching script from here.\n", encoding="utf-8")
+        say(f"    Tidied up: moved {', '.join(moved)} into “{OTHER_SCRIPTS_DIR.name}”.")
+
+
 def create_shortcuts(state):
     """Desktop + Start-menu/Applications entry with the app icon. Re-created if the folder moved."""
     if state.get("shortcuts_for") == str(ROOT):
         return
     try:
         if IS_WIN:
-            target = ROOT / "start.bat"
+            target = ROOT / MY_SCRIPT
             icon = ICON_DIR / "app-icon.ico"
             ps = (
                 "$s=New-Object -ComObject WScript.Shell;"
@@ -434,7 +516,7 @@ def create_shortcuts(state):
             launcher = macos / "LocalAIVtuber"
             # Finds its own folder at run time, so moving the app folder keeps it working.
             launcher.write_text('#!/bin/bash\nDIR="$(cd "$(dirname "$0")/../../.." && pwd)"\n'
-                                'open -a Terminal "$DIR/start.command"\n', encoding="utf-8")
+                                f'open -a Terminal "$DIR/{MY_SCRIPT}"\n', encoding="utf-8")
             launcher.chmod(0o755)
             (app / "Contents" / "Info.plist").write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -457,7 +539,7 @@ def create_shortcuts(state):
 Type=Application
 Name={APP_NAME}
 Comment=Local AI VTuber
-Exec="{ROOT / 'start.sh'}"
+Exec="{ROOT / MY_SCRIPT}"
 Path={ROOT}
 Icon={ICON_DIR / 'app-icon.png'}
 Terminal=true
@@ -568,6 +650,12 @@ def start_app(no_window=False):
         return
     window = open_window()
     if window:
+        try:  # lets the performance monitor show the window's own GPU/CPU use
+            req = urllib.request.Request(f"{URL}/api/system/window", data=json.dumps({"pid": window.pid}).encode(),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=3).close()
+        except Exception:
+            pass
         say("    Close the app window (or use Quit in the app) to stop everything.")
         while server.poll() is None and window.poll() is None:
             time.sleep(1)
@@ -583,6 +671,7 @@ def main():
     parser.add_argument("--setup", action="store_true", help="choose the model and voice engine again")
     parser.add_argument("--no-window", action="store_true", help="do not open the app window")
     parser.add_argument("--install-only", action="store_true", help="set everything up but do not start")
+    parser.add_argument("--started-by", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     say(f"{APP_NAME} - folder: {ROOT}")
@@ -593,6 +682,7 @@ def main():
         state.pop("voice_done", None)
         state.pop("llm_done", None)
     relocate_envs(state)
+    tidy_start_scripts()
     gpu = detect_gpu()
     setup_frontend()
     setup_main_env(state, gpu, args.update)

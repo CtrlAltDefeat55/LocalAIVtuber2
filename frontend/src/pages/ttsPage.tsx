@@ -19,6 +19,8 @@ import { api, goToPage, readError } from "@/lib/api"
 import { ttsManager } from "@/lib/ttsManager"
 import { RVCProvider } from "@/lib/tts/rvcProvider"
 import { cn } from "@/lib/utils"
+import { FitBadge, useHardware } from "@/components/hardware-card"
+import { RemoteVoicePanel } from "@/components/remote-voice-panel"
 
 type EngineState = "not_installed" | "installing" | "stopped" | "starting" | "ready" | "error"
 
@@ -44,6 +46,8 @@ interface Engine {
 }
 
 interface EnginesResponse {
+  source: string
+  remote: { voice: string; voice_name: string; base_url: string; state: string; error: string | null }
   active_engine: string
   current_voice: string | null
   engines: Engine[]
@@ -87,6 +91,17 @@ export default function TTSPage({ isActive }: { isActive: boolean }) {
   const { refresh: refreshStatus } = useSystemStatus()
   const { confirm, dialog } = useConfirm()
   const provider = settings["tts.provider"] === "rvc" ? "rvc" : "local"
+  const { info: hw } = useHardware()
+  const voiceFits = hw?.recommendation.voice_fits ?? {}
+  const [view, setView] = useState<"local" | "voicebox" | "api">("local")
+  const source = data?.source
+  useEffect(() => {
+    if (source) setView(source === "local" ? "local" : source === "voicebox" ? "voicebox" : "api")
+  }, [source])
+  const switchToLocal = () => act(async () => {
+    await api("/api/tts/source/local", { method: "POST" })
+    setView("local")
+  }, "Using voice engines on this PC")
 
   const loadEngines = useCallback(async () => {
     try { setData(await api<EnginesResponse>("/api/tts/engines")) } catch (e) { console.error(e) }
@@ -167,19 +182,47 @@ export default function TTSPage({ isActive }: { isActive: boolean }) {
   return (
     <PageBody>
       <PageHeader icon={AudioLines} title="Voice"
-        description="Pick how your VTuber sounds: a voice engine plus a short reference recording to clone. Engines install with one click and run on this computer."
+        description="Pick how your VTuber sounds: an engine on this PC with a short recording to clone, or a voice from Voicebox, ElevenLabs or another service."
         actions={<Button variant="outline" onClick={() => api("/api/system/open-folder", { method: "POST", json: { which: "voices" } }).catch((e) => toast.error(e.message))}>
           <FolderOpen /> Voices folder
         </Button>}
       />
 
-      <VoiceTester engineLabel={provider === "rvc" ? "RVC" : active?.label} voice={currentVoice} />
+      <VoiceTester engineLabel={source && source !== "local" ? `${source === "voicebox" ? "Voicebox" : source === "elevenlabs" ? "ElevenLabs" : "API"}` : provider === "rvc" ? "RVC" : active?.label}
+        voice={source && source !== "local" ? data?.remote.voice_name || data?.remote.voice || null : currentVoice} />
+
+      <div className="mt-6 grid grid-cols-3 gap-1 rounded-xl bg-muted p-1" role="radiogroup" aria-label="Where the voice comes from">
+        {([["local", "This PC", "Engines installed here"], ["voicebox", "Voicebox", "Voicebox on this or another PC"],
+          ["api", "Online / API", "ElevenLabs, OpenAI or any compatible server"]] as const).map(([k, title, sub]) => {
+          const active = k === "local" ? source === "local" : k === "voicebox" ? source === "voicebox" : !!source && !["local", "voicebox"].includes(source)
+          return (
+            <button key={k} role="radio" aria-checked={view === k}
+              onClick={() => (k === "local" && source !== "local" ? switchToLocal() : setView(k))}
+              className={cn("rounded-lg px-4 py-2.5 text-left transition-colors", view === k ? "bg-background shadow-sm" : "text-muted-foreground hover:text-foreground")}>
+              <div className="text-sm font-medium">{title}{active && <span className="ml-2 text-xs text-primary">● active</span>}</div>
+              <div className="text-xs text-muted-foreground">{sub}</div>
+            </button>
+          )
+        })}
+      </div>
+
+      {view !== "local" ? (
+        <Section className="mt-6" title={view === "voicebox" ? "Connect to Voicebox" : "Connect to a voice API"}
+          description={view === "voicebox"
+            ? "Voicebox is a free voice studio with many engines. Your VTuber speaks with a Voicebox voice profile, running on this PC or another one."
+            : "Paid services like ElevenLabs, or any server with an OpenAI-compatible /audio/speech endpoint (OpenAI, Kokoro-FastAPI, LocalAI…)."}>
+          <RemoteVoicePanel key={view} providers={view === "voicebox" ? ["voicebox"] : ["elevenlabs", "openai"]} onSaved={loadEngines} />
+          {data?.remote.error && source !== "local" && (
+            <p className="mt-3 text-[13px] text-destructive">Last request failed: {data.remote.error}</p>
+          )}
+        </Section>
+      ) : <>
 
       <Section className="mt-6" title="Voice engine"
         description={data ? `Detected: ${data.gpu.kind === "cuda" ? `NVIDIA GPU${data.gpu.name ? ` (${data.gpu.name})` : ""}` : data.gpu.kind === "mps" ? "Apple Silicon GPU" : "no supported GPU (CPU mode)"}. Speed matters most for live chat; Chatterbox Turbo is the best balance, LuxTTS the fastest.` : undefined}>
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
           {data?.engines.map((engine) => {
-            const isActive = provider === "local" && data.active_engine === engine.id
+            const isActive = provider === "local" && source === "local" && data.active_engine === engine.id
             const [tone, label] = engineTone(engine.state)
             return (
               <div key={engine.id} className={cn("flex flex-col rounded-xl border p-4 transition-colors",
@@ -223,6 +266,7 @@ export default function TTSPage({ isActive }: { isActive: boolean }) {
                   <Meter label="Speed" value={engine.speed} />
                   <Meter label="Quality" value={engine.quality} />
                 </div>
+                <FitBadge fit={voiceFits[engine.id]} className="mt-2 self-start" />
                 <div className="mt-2 flex flex-wrap gap-x-4 text-xs text-muted-foreground">
                   <span>GPU: <span className="text-foreground">{engine.vram}</span></span>
                   <span>Languages: <span className="text-foreground">{engine.languages.join(", ")}</span></span>
@@ -315,6 +359,7 @@ export default function TTSPage({ isActive }: { isActive: boolean }) {
         )}
         {provider === "local" && <SpeedControl engineId={data?.active_engine} initial={data?.options.speed ?? 1} />}
       </Section>
+      </>}
 
       <VoiceDialog state={voiceDialog} onClose={() => setVoiceDialog(null)} onSaved={loadVoices} minRef={minRef} engineLabel={active?.label} />
       <LogDialog engine={data?.engines.find((e) => e.id === logFor) ?? null} onClose={() => setLogFor(null)} />

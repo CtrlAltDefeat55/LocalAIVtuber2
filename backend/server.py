@@ -42,6 +42,8 @@ from services.TTS.routes import create_router as create_tts_router
 from services.lib.LAV_logger import logger
 from services.lib.port_forward import create_proxy_middleware
 from services.lib.process_manager import process_manager
+from services.lib import hardware
+from services.lib.monitor import usage_monitor
 
 APP_VERSION = "3.0.0"
 HOST, PORT = "127.0.0.1", int(os.environ.get("LAV_PORT", "8000"))
@@ -556,6 +558,21 @@ class SettingsManager:
         if model_key in keys and s.get(model_key):
             llm.select_model(s[model_key], load=False)
 
+        remote_llm = {k.split(".")[-1]: s[k] for k in ("llm.remote.preset", "llm.remote.base_url", "llm.remote.model")
+                      if k in s and k in keys}
+        if remote_llm:
+            llm.set_remote(**remote_llm)
+        if "llm.provider" in keys and "llm.provider" in s:
+            llm.set_provider(s["llm.provider"])
+
+        remote_tts = {k.split(".")[-1]: s[k] for k in ("tts.remote.base_url", "tts.remote.voice", "tts.remote.voice_name",
+                                                       "tts.remote.model", "tts.remote.language") if k in s and k in keys}
+        if remote_tts:
+            tts.remote.update(remote_tts)
+            tts.remote_error = None
+        if "tts.source" in keys and "tts.source" in s:
+            tts.set_source(s["tts.source"])
+
         if "stream.yt.videoid" in keys and "stream.yt.videoid" in s:
             chat_fetch.video_id = s["stream.yt.videoid"]
         if "tts.speed" in keys and "tts.speed" in s:
@@ -591,7 +608,7 @@ startup_progress.show_step("Applying Settings")
 settings_manager.apply_settings()
 startup_progress.complete_step(f"Settings applied in {time.time() - start_time:.2f}s")
 
-app.include_router(create_llm_router(llm))
+app.include_router(create_llm_router(llm, lambda values: settings_manager.update_settings(values)))
 app.include_router(create_tts_router(tts, lambda values: settings_manager.update_settings(values)))
 
 
@@ -642,12 +659,37 @@ async def system_status():
     return {
         "version": APP_VERSION,
         "llm": llm.status(),
-        "tts": {"active_engine": tts.active_engine, "current_voice": tts.current_voice,
-                "state": tts.engines.engine_state(tts.active_engine),
-                "error": tts.engines.errors.get(tts.active_engine)},
+        "tts": tts.summary(),
         "gpu": {k: v for k, v in tts.gpu.items() if k != "index"},
         "platform": sys.platform,
     }
+
+_hardware_cache: Dict[str, Any] = {}
+
+@app.get("/api/system/hardware")
+async def system_hardware(refresh: bool = False):
+    """What this computer has and which models/voices will run well on it."""
+    if refresh or "info" not in _hardware_cache:
+        _hardware_cache["info"] = await asyncio.to_thread(hardware.scan)
+    info = dict(_hardware_cache["info"])
+    llm._load_available_models()
+    info["recommendation"] = hardware.recommend(info, llm.all_model_data)
+    return info
+
+@app.get("/api/system/usage")
+async def system_usage():
+    """Live CPU / RAM / GPU use split by LLM, voice, app window, this app and other programs."""
+    gpu_info = _hardware_cache.get("info", {}).get("gpus", [])
+    return await asyncio.to_thread(usage_monitor.sample, gpu_info)
+
+class WindowRequest(BaseModel):
+    pid: int
+
+@app.post("/api/system/window")
+async def register_window(request: WindowRequest):
+    """The launcher reports the app-window browser process so its usage shows as 'Character window'."""
+    usage_monitor.register_window(request.pid)
+    return {"ok": True}
 
 FOLDERS = {
     "models": LLM_MODELS_DIR,
@@ -701,8 +743,9 @@ async def warm_up():
     threading.Thread(target=start_rvc, daemon=True).start()
     if llm.keep_model_loaded and (llm.current_model_data or {}).get("file_exists"):
         llm.load_in_background()
-    if tts.engines.is_installed(tts.active_engine):
+    if tts.source == "local" and tts.engines.is_installed(tts.active_engine):
         tts.start_in_background()
+    _hardware_cache["info"] = await asyncio.to_thread(hardware.scan)
     startup_progress.complete_step(
         f"Server ready in {time.time() - total_start_time:.2f}s at {datetime.now().strftime('%H:%M:%S')} "
         f"- open http://{HOST}:{PORT}")

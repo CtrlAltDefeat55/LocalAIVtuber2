@@ -19,14 +19,17 @@ function SetupChecklist() {
     const steps = [
         {
             done: status.llm.model_downloaded,
-            title: "Download a brain",
-            text: `${status.llm.model_name ?? "A language model"} is not downloaded yet.`,
+            title: "Get a brain",
+            text: status.llm.provider === "remote" ? "Finish connecting your API on the Brain page."
+                : `Download ${status.llm.model_name ?? "a language model"}, or connect LM Studio / an API.`,
             action: "Open Brain", page: "brain", icon: Brain,
         },
         {
             done: !["not_installed", "installing"].includes(status.tts.state),
-            title: "Install a voice engine",
-            text: status.tts.state === "installing" ? "Installing… you can keep using the app." : "One click on the Voice page (Chatterbox Turbo is recommended).",
+            title: "Set up a voice",
+            text: status.tts.state === "installing" ? "Installing… you can keep using the app."
+                : status.tts.source !== "local" ? "Pick a voice from your connected voice service."
+                : "Install an engine (one click) or connect Voicebox / an API.",
             action: "Open Voice", page: "tts", icon: AudioLines,
         },
     ]

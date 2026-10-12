@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label";
 import { useSettings } from "@/context/SettingsContext";
 import { useSystemStatus } from "@/context/SystemStatusContext";
 import { api } from "@/lib/api";
+import { HardwareSummary } from "@/components/hardware-card";
 
 const FOLDERS: [string, string, string][] = [
     ["app", "App folder", "Everything: runtimes, models, voices, settings. Move this folder to move the whole app."],
@@ -83,8 +84,12 @@ function SettingsPage() {
                     <div className="space-y-3">
                         <SettingSwitch id="tts.enabled" label="Speak replies out loud"
                             description="Turn off for text-only chat (useful for testing prompts without waiting for the voice)." />
+                        <SettingSwitch id="ui.performanceBar" label="Show the performance bar"
+                            description="The strip at the bottom showing CPU, RAM and GPU use by the brain, voice and other programs." />
                     </div>
                 </Section>
+
+                <HardwareSummary />
 
                 <TokenSection />
 

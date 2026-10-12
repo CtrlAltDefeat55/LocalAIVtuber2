@@ -14,6 +14,8 @@ import SettingSwitch from "@/components/setting-switch"
 import SettingSlider from "@/components/setting-slider"
 import SettingTextbox from "@/components/setting-textbox"
 import { useConfirm } from "@/components/confirm-dialog"
+import { FitBadge, HardwareSummary, useHardware } from "@/components/hardware-card"
+import { RemoteLLMPanel } from "@/components/remote-llm-panel"
 import { useSettings } from "@/context/SettingsContext"
 import { useSystemStatus } from "@/context/SystemStatusContext"
 import { api, formatBytes, formatDuration } from "@/lib/api"
@@ -67,6 +69,11 @@ export default function BrainPage({ isActive }: { isActive: boolean }) {
   const { status, refresh } = useSystemStatus()
   const { settings, updateSetting } = useSettings()
   const { confirm, dialog } = useConfirm()
+  const { info: hw } = useHardware()
+  const fits = hw?.recommendation.model_fits ?? {}
+  const [view, setView] = useState<"local" | "api">("local")
+  const provider = status?.llm.provider
+  useEffect(() => { if (provider) setView(provider === "remote" ? "api" : "local") }, [provider])
 
   const load = useCallback(async () => {
     try {
@@ -130,20 +137,68 @@ export default function BrainPage({ isActive }: { isActive: boolean }) {
   const openFolder = () => api("/api/system/open-folder", { method: "POST", json: { which: "models" } })
     .catch((e) => toast.error((e as Error).message))
 
-  const visionAvailable = Boolean(current?.mmproj_exists)
+  const visionAvailable = Boolean(current?.mmproj_exists) || provider === "remote"
+
+  const useRecommended = async () => {
+    const rec = hw?.recommendation
+    const target = rec && models.find((m) => m.id === rec.llm)
+    if (!rec || !target) return
+    await run(`rec`, async () => {
+      if (provider === "remote") await api("/api/llm/provider/local", { method: "POST" })
+      await updateSetting("llm.context_size", rec.context_size, { immediate: true })
+      await updateSetting("llm.model_id", target.id, { immediate: true })
+      setCurrentId(target.id)
+      if (!target.file_exists && target.downloadable) await api("/api/llm/models/download", { method: "POST", json: { model_id: target.id } })
+    }, target.file_exists ? `Switched to ${target.displayName}` : `Downloading ${target.displayName}. Progress is shown in the library below.`)
+  }
+
+  const switchToLocal = () => run("local", async () => {
+    await api("/api/llm/provider/local", { method: "POST" })
+    setView("local")
+  }, "Using the model on this PC")
 
   return (
     <PageBody>
       <PageHeader
         icon={Brain}
         title="Brain"
-        description="The language model your VTuber thinks with. Everything runs on this computer; models are downloaded once and kept in the app folder."
+        description="The language model your VTuber thinks with. Run it on this computer, or connect LM Studio, Ollama or an online API."
         actions={<>
           <Button variant="outline" onClick={openFolder}><FolderOpen /> Models folder</Button>
           <Button variant="outline" onClick={() => setAddOpen(true)}><Plus /> Add from Hugging Face</Button>
         </>}
       />
 
+      <div className="mb-6">
+        <HardwareSummary actions={hw && (() => {
+          const target = models.find((m) => m.id === hw.recommendation.llm)
+          const already = provider === "local" && target?.id === currentId && target?.file_exists
+          return target ? (
+            <Button size="sm" onClick={useRecommended} disabled={already || busy === "rec"}>
+              {already ? <><Check /> Using {target.displayName}</> : busy === "rec" ? <><Loader2 className="animate-spin" /> Applying…</> :
+                <>Use {target.displayName}{target.file_exists ? "" : ` (download ${target.size_hint ?? ""})`}</>}
+            </Button>
+          ) : null
+        })()} />
+      </div>
+
+      <div className="mb-6 grid grid-cols-2 gap-1 rounded-xl bg-muted p-1" role="radiogroup" aria-label="Where the brain runs">
+        {([["local", "Run on this PC", "Download a model and run it here"], ["api", "Use an API", "LM Studio or Ollama on any PC, or an online service"]] as const).map(([k, title, sub]) => (
+          <button key={k} role="radio" aria-checked={view === k}
+            onClick={() => (k === "local" && provider === "remote" ? switchToLocal() : setView(k))}
+            className={cn("rounded-lg px-4 py-2.5 text-left transition-colors",
+              view === k ? "bg-background shadow-sm" : "text-muted-foreground hover:text-foreground")}>
+            <div className="text-sm font-medium">{title}{(k === "api") === (provider === "remote") && <span className="ml-2 text-xs text-primary">● active</span>}</div>
+            <div className="text-xs text-muted-foreground">{sub}</div>
+          </button>
+        ))}
+      </div>
+
+      {view === "api" ? (
+        <Section title="Connect to an API" description="Use a model running in LM Studio, Ollama or another server (on this or another computer), or a paid online service. The local model stays unloaded while an API is in use.">
+          <RemoteLLMPanel />
+        </Section>
+      ) : <>
       {/* Current model + runtime state */}
       <div className="mb-6 rounded-2xl border bg-card p-5 shadow-xs">
         <div className="flex flex-wrap items-center justify-between gap-4">
@@ -211,7 +266,8 @@ export default function BrainPage({ isActive }: { isActive: boolean }) {
                     <h3 className="truncate font-semibold">{m.displayName}</h3>
                     {isCurrent && <Badge className="bg-primary/15 text-primary border-primary/30" variant="outline"><Check /> {m.file_exists ? "In use" : "Selected"}</Badge>}
                   </div>
-                  <div className="mt-1 flex flex-wrap gap-1">
+                  <FitBadge fit={fits[m.id]} className="mt-1.5" />
+                  <div className="mt-1.5 flex flex-wrap gap-1">
                     {(m.tags ?? []).map((t) => (
                       <Badge key={t} variant="outline" className={cn("text-[11px]", t === "Recommended" && "border-primary/40 text-primary")}>{t}</Badge>
                     ))}
@@ -266,6 +322,8 @@ export default function BrainPage({ isActive }: { isActive: boolean }) {
         })}
       </div>
 
+      </>}
+
       <div className="mt-8 space-y-6">
         <Section title="Personality" description="Who your VTuber is. Sent with every message.">
           <div className="space-y-5">
@@ -276,6 +334,7 @@ export default function BrainPage({ isActive }: { isActive: boolean }) {
           </div>
         </Section>
 
+        {view === "local" && (
         <Section title="Performance" description="Changing these restarts the model (a few seconds to a minute).">
           <div className="grid grid-cols-1 gap-x-10 gap-y-5 md:grid-cols-2">
             <div className="space-y-2">
@@ -326,6 +385,7 @@ export default function BrainPage({ isActive }: { isActive: boolean }) {
             </div>
           </div>
         </Section>
+        )}
 
         <Collapsible>
           <Section title="Sampling" description="Fine-tune how creative or predictable replies are."

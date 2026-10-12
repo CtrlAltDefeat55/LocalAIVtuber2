@@ -12,6 +12,8 @@ import httpx
 
 from services.lib.LAV_logger import logger
 from services.lib.paths import LLM_MODELS_DIR
+from services.lib.secrets import get_secret
+from . import remote as remote_api
 from .llama_server import LlamaServer, find_llama_server
 
 # Rough characters-per-token used to keep requests inside the context window
@@ -52,6 +54,10 @@ class LLM:
             "thinking": False,
             "max_tokens": 512,
         }
+        # "local" = llama-server on this PC; "remote" = an OpenAI-compatible API (LM Studio, OpenAI, ...)
+        self.provider = "local"
+        self.remote = {"preset": "lmstudio", "base_url": "", "model": ""}
+        self.remote_error: Optional[str] = None
         self._load_available_models()
 
     # ------------------------------------------------------------------ catalog
@@ -143,8 +149,26 @@ class LLM:
         return f"{round(size_bytes / math.pow(1024, i), 2)} {names[i]}"
 
     def status(self) -> dict:
+        if self.provider == "remote":
+            r = self.remote
+            configured = bool(r["base_url"] and r["model"])
+            label = remote_api.PRESETS.get(r["preset"], {}).get("label", "API")
+            return {
+                "provider": "remote",
+                "state": "error" if self.remote_error else ("ready" if configured else "stopped"),
+                "error": self.remote_error if configured else "Set up the API connection on the Brain page.",
+                "runtime_installed": True,
+                "model_id": None,
+                "model_name": f"{r['model'] or 'No model'} · {label}",
+                "model_downloaded": configured,
+                "loaded_model_id": None,
+                "vision_active": bool(self.runtime_options["enable_vision"]),
+                "options": self.runtime_options,
+                "remote": {**r, "has_key": bool(get_secret("llm.remote"))},
+            }
         model = self.current_model_data or {}
         return {
+            "provider": "local",
             "state": self.state,
             "error": self.error,
             "runtime_installed": find_llama_server() is not None,
@@ -203,6 +227,8 @@ class LLM:
 
     def load_model(self, model_data: Optional[dict] = None):
         """Blocking: start llama-server with the model. Safe to call repeatedly."""
+        if self.provider == "remote":
+            return  # the brain runs elsewhere; nothing to load here
         model_data = model_data or self.current_model_data
         if not model_data:
             self.state, self.error = "error", "No model selected. Pick or download a model on the Brain page."
@@ -258,7 +284,32 @@ class LLM:
         self.sampling_params.update(params)
         logger.info(f"Updated sampling parameters: {self.sampling_params}")
 
+    def set_provider(self, provider: str):
+        provider = "remote" if provider == "remote" else "local"
+        if provider == self.provider:
+            return
+        self.provider = provider
+        if provider == "remote":
+            self.unload_model()  # free the GPU when a remote brain is used
+        elif self.keep_model_loaded and (self.current_model_data or {}).get("file_exists"):
+            self.load_in_background()
+
+    def set_remote(self, **values):
+        self.remote.update({k: v for k, v in values.items() if v is not None})
+        self.remote["base_url"] = remote_api.normalize_url(self.remote["base_url"], self.remote["preset"])
+        self.remote_error = None
+
+    def _remote_endpoint(self) -> tuple:
+        r = self.remote
+        if not r["base_url"] or not r["model"]:
+            raise RuntimeError("The API connection isn't set up yet. Open the Brain page, choose “Use an API” and "
+                               "test the connection.")
+        return f"{r['base_url']}/chat/completions", remote_api.headers(get_secret("llm.remote"))
+
     async def ensure_loaded(self):
+        if self.provider == "remote":
+            self._remote_endpoint()  # raises a helpful error when not configured
+            return
         if self.loaded_model_id == (self.current_model_data or {}).get("id") and self.server.is_running():
             return
         await asyncio.to_thread(self.load_model, self.current_model_data)
@@ -267,6 +318,12 @@ class LLM:
 
     def _sampling(self) -> dict:
         p = self.sampling_params
+        if self.provider == "remote" and not remote_api.PRESETS.get(self.remote["preset"], {}).get("local_server"):
+            # hosted APIs reject llama.cpp-only parameters such as top_k / min_p
+            out = {"temperature": min(p["temperature"], 2.0), "top_p": p["top_p"]}
+            if int(p.get("seed", -1)) >= 0:
+                out["seed"] = int(p["seed"])
+            return out
         out = {
             "temperature": p["temperature"], "top_k": p["top_k"], "top_p": p["top_p"],
             "min_p": p["min_p"], "repeat_penalty": p["repeat_penalty"],
@@ -290,10 +347,13 @@ class LLM:
         return messages
 
     def _template_kwargs(self) -> dict:
+        if self.provider == "remote":
+            return {}
         return {"chat_template_kwargs": {"enable_thinking": bool(self.runtime_options["thinking"])}}
 
     def _screenshot_part(self) -> Optional[dict]:
-        if not self.server.mmproj_path:
+        vision = self.runtime_options["enable_vision"] if self.provider == "remote" else bool(self.server.mmproj_path)
+        if not vision:
             logger.info("Screenshot requested but vision is not active for this model; sending text only.")
             return None
         try:
@@ -323,15 +383,39 @@ class LLM:
         messages.append({"role": "user", "content": user_content})
         body = {"messages": self._fit_context(messages), "stream": True,
                 "max_tokens": int(self.runtime_options["max_tokens"]), **self._sampling(), **self._template_kwargs()}
-        async for chunk in self._stream(f"{self.server.base_url}/v1/chat/completions", body, chat=True):
+        async for chunk in self._chat(body):
             yield chunk
         self._maybe_unload()
+
+    async def _chat(self, body: dict) -> AsyncGenerator[str, None]:
+        if self.provider != "remote":
+            async for chunk in self._stream(f"{self.server.base_url}/v1/chat/completions", body, chat=True):
+                yield chunk
+            return
+        url, hdrs = self._remote_endpoint()
+        body = {**body, "model": self.remote["model"]}
+        try:
+            async for chunk in self._stream(url, body, chat=True, headers=hdrs):
+                yield chunk
+            self.remote_error = None
+        except Exception as e:
+            self.remote_error = remote_api.explain(e, self.remote["base_url"])
+            raise RuntimeError(self.remote_error) from e
 
     async def complete_current_response(self, history, system_prompt) -> AsyncGenerator[str, None]:
         """Continue the last (partial) assistant message in `history`."""
         if not history:
             return
         await self.ensure_loaded()
+        if self.provider == "remote":
+            # Remote APIs have no raw-prompt endpoint; ask the model to carry on instead.
+            messages = [{"role": "system", "content": system_prompt or ""}] + list(history) + [
+                {"role": "user", "content": "(Continue your previous reply exactly where it stopped. Do not repeat it.)"}]
+            body = {"messages": self._fit_context(messages), "stream": True,
+                    "max_tokens": int(self.runtime_options["max_tokens"]), **self._sampling()}
+            async for chunk in self._chat(body):
+                yield chunk
+            return
         messages = [{"role": "system", "content": system_prompt or ""}] + list(history)
         partial = ""
         if messages[-1]["role"] == "assistant":
@@ -348,13 +432,14 @@ class LLM:
             yield chunk
         self._maybe_unload()
 
-    async def _stream(self, url: str, body: dict, chat: bool) -> AsyncGenerator[str, None]:
+    async def _stream(self, url: str, body: dict, chat: bool, headers: Optional[dict] = None) -> AsyncGenerator[str, None]:
         in_think = False
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=300, write=60, pool=10)) as client:
-            async with client.stream("POST", url, json=body) as resp:
+            async with client.stream("POST", url, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
                     detail = (await resp.aread()).decode(errors="replace")[:500]
-                    raise RuntimeError(f"LLM request failed ({resp.status_code}): {detail}")
+                    raise httpx.HTTPStatusError(f"LLM request failed ({resp.status_code}): {detail}",
+                                                request=resp.request, response=resp)
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
                         continue
@@ -365,7 +450,11 @@ class LLM:
                         data = json.loads(payload)
                     except json.JSONDecodeError:
                         continue
-                    piece = (data["choices"][0]["delta"].get("content") if chat else data.get("content")) or ""
+                    if chat:
+                        choices = data.get("choices") or []  # some APIs send usage-only chunks
+                        piece = ((choices[0].get("delta") or {}).get("content") if choices else "") or ""
+                    else:
+                        piece = data.get("content") or ""
                     # Hide any inline reasoning a template emits even with thinking off.
                     out = ""
                     while piece:
@@ -386,5 +475,5 @@ class LLM:
                         break
 
     def _maybe_unload(self):
-        if not self.keep_model_loaded:
+        if self.provider == "local" and not self.keep_model_loaded:
             self.unload_model()

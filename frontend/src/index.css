@@ -52,6 +52,12 @@
   --sidebar-border: oklch(0.9 0.008 290);
   --sidebar-ring: oklch(0.53 0.2 300 / 55%);
   --brand-gradient: linear-gradient(135deg, oklch(0.6 0.22 295), oklch(0.68 0.21 350));
+  /* performance monitor: validated categorical slots 1-4 (light), neutral for "other programs" */
+  --viz-llm: #2a78d6;
+  --viz-voice: #eb6834;
+  --viz-window: #1baf7a;
+  --viz-app: #eda100;
+  --viz-other: #a8a7a1;
 }
 
 .dark {
@@ -89,6 +95,11 @@
   --sidebar-accent-foreground: oklch(0.97 0.005 290);
   --sidebar-border: oklch(1 0 0 / 7%);
   --sidebar-ring: oklch(0.74 0.16 305 / 60%);
+  --viz-llm: #3987e5;
+  --viz-voice: #d95926;
+  --viz-window: #199e70;
+  --viz-app: #c98500;
+  --viz-other: #5f5e5a;
 }
 
 @theme inline {

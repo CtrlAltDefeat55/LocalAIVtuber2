@@ -1,9 +1,10 @@
 import { CharacterRender } from "@/components/character-render"
 
-function CharacterPage() {
+function CharacterPage({ isActive }: { isActive: boolean }) {
     return (
         <div className="h-full w-full">
-            <CharacterRender />
+            {/* rendering pauses while another page is open, so the GPU stays free */}
+            <CharacterRender isActive={isActive} />
         </div>
     )
 }

@@ -22,7 +22,8 @@ import { useConfirm } from "./confirm-dialog"
 import appIcon from "@/assets/app-icon.svg"
 import { cn } from "@/lib/utils"
 
-function brainTone(state?: string, downloaded?: boolean, runtime?: boolean): [Tone, string] {
+function brainTone(state?: string, downloaded?: boolean, runtime?: boolean, remote?: boolean): [Tone, string] {
+  if (remote) return state === "ready" ? ["ok", "API connected"] : state === "error" ? ["error", "API error"] : ["warn", "API not set up"]
   if (runtime === false) return ["error", "Runtime missing"]
   if (!downloaded) return ["warn", "No model downloaded"]
   switch (state) {
@@ -33,7 +34,8 @@ function brainTone(state?: string, downloaded?: boolean, runtime?: boolean): [To
   }
 }
 
-function voiceTone(state?: string): [Tone, string] {
+function voiceTone(state?: string, remote?: boolean): [Tone, string] {
+  if (remote) return state === "ready" ? ["ok", "Service connected"] : state === "error" ? ["error", "Service error"] : ["warn", "Not set up"]
   switch (state) {
     case "ready": return ["ok", "Ready"]
     case "starting": return ["busy", "Starting…"]
@@ -49,8 +51,8 @@ export function AppSidebar({ onItemClick, activePage }: { onItemClick: (key: Pag
   const { state } = useSidebar()
   const collapsed = state === "collapsed"
   const { confirm, dialog } = useConfirm()
-  const [bTone, bLabel] = brainTone(status?.llm.state, status?.llm.model_downloaded, status?.llm.runtime_installed)
-  const [vTone, vLabel] = voiceTone(status?.tts.state)
+  const [bTone, bLabel] = brainTone(status?.llm.state, status?.llm.model_downloaded, status?.llm.runtime_installed, status?.llm.provider === "remote")
+  const [vTone, vLabel] = voiceTone(status?.tts.state, !!status?.tts.source && status.tts.source !== "local")
 
   const quit = async () => {
     const ok = await confirm({

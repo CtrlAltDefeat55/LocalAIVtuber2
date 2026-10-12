@@ -1,7 +1,9 @@
 #!/bin/bash
-# Linux / macOS launcher. Everything stays inside this folder.
+# Installs on first run, then starts Local AI VTuber. Everything stays inside this folder.
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
+# Works from the app folder, or from "Other start scripts" inside it.
+if [ ! -f "$DIR/launcher/launcher.py" ] && [ -f "$DIR/../launcher/launcher.py" ]; then DIR="$(cd "$DIR/.." && pwd)"; fi
 cd "$DIR"
 export UV_PYTHON_INSTALL_DIR="$DIR/runtime/python"
 export UV_CACHE_DIR="$DIR/cache/uv"
@@ -26,4 +28,4 @@ if [ ! -x "$UV" ]; then
   chmod +x "$UV"
 fi
 
-exec "$UV" run --no-project --python 3.11 "$DIR/launcher/launcher.py" "$@"
+exec "$UV" run --no-project --python 3.11 "$DIR/launcher/launcher.py" --started-by "$(basename "$0")" "$@"

@@ -3,12 +3,19 @@
     "description": "Fast, lighter option with good chat quality. Fits fully on a 10-12 GB GPU, so it answers quicker than the 27B model on mid-range cards. Can see your screen when Vision is enabled.",
     "repo": "unsloth/gemma-4-12b-it-GGUF",
     "quant": "UD-Q4_K_XL",
-    "fallback_quants": ["Q4_K_M", "Q4_K_S"],
+    "fallback_quants": [
+        "Q4_K_M",
+        "Q4_K_S"
+    ],
     "vision": true,
     "type": "text",
     "size_hint": "~7.5 GB",
     "vram_hint": "10 GB recommended",
-    "tags": ["Fast", "Vision"],
+    "tags": [
+        "Fast",
+        "Vision"
+    ],
     "recommended": true,
-    "order": 2
+    "order": 2,
+    "size_gb": 7.5
 }

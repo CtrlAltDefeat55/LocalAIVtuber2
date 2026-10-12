@@ -3,6 +3,7 @@
   python tools/setup_assets.py engine chatterbox     install a voice engine
   python tools/setup_assets.py model <model_id>      download a language model and select it
   python tools/setup_assets.py models                list catalog models as JSON
+  python tools/setup_assets.py hardware [--json]     scan this PC and recommend models
 """
 import asyncio
 import json
@@ -97,6 +98,34 @@ async def _download_model(model_id: str) -> int:
     return 0
 
 
+def hardware_report(as_json: bool) -> int:
+    from services.LLM.LLM import LLM
+    from services.lib import hardware
+    info = hardware.scan()
+    info["recommendation"] = hardware.recommend(info, LLM().all_model_data)
+    if as_json:
+        print("HARDWARE_JSON " + json.dumps(info))
+        return 0
+    rec = info["recommendation"]
+    cpu, ram = info["cpu"], info["ram"]
+    print(f"  CPU : {cpu['name']} ({cpu['cores']} cores / {cpu['threads']} threads)")
+    print(f"  RAM : {ram['total_gb']:g} GB ({ram['available_gb']:g} GB free right now)")
+    if info["gpus"]:
+        for g in info["gpus"]:
+            mem = f"{g['vram_gb']:g} GB" if g.get("vram_gb") else "memory unknown"
+            print(f"  GPU : {g['name']} ({mem}{', shared with system RAM' if g.get('unified') else ''})")
+    else:
+        print("  GPU : none detected")
+    if info.get("disk"):
+        print(f"  Disk: {info['disk']['free_gb']:g} GB free in the app folder's drive")
+    for note in info["notes"]:
+        print(f"  [!] {note}")
+    print("\n  Recommendation for this PC:")
+    for reason in rec["reasons"]:
+        print(f"   - {reason}")
+    return 0
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -106,6 +135,8 @@ def main():
         return install_engine(sys.argv[2])
     if cmd == "model":
         return asyncio.run(_download_model(sys.argv[2]))
+    if cmd == "hardware":
+        return hardware_report("--json" in sys.argv)
     if cmd == "models":
         from services.LLM.LLM import LLM
         print(json.dumps([{k: m.get(k) for k in ("id", "displayName", "size_hint", "vram_hint", "file_exists")}

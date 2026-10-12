@@ -6,6 +6,8 @@ import { SettingsProvider, useSettings } from "@/context/SettingsContext"
 import { SystemStatusProvider, useSystemStatus } from "@/context/SystemStatusContext"
 import { ttsManager } from "@/lib/ttsManager"
 import { PowerOff } from "lucide-react"
+import { PerformanceDock } from "@/components/performance-dock"
+import { HardwareProvider } from "@/components/hardware-card"
 import appIcon from "@/assets/app-icon.svg"
 
 const PAGE_STORAGE_KEY = "lav.page"
@@ -80,7 +82,7 @@ function Shell() {
             <SettingsBridge />
             <AppSidebar onItemClick={navigate} activePage={currentPage} />
             <SidebarInset className="h-screen overflow-hidden">
-                <main className="relative flex-1 h-full">
+                <main className="relative min-h-0 flex-1">
                     {(Object.keys(pageMapping) as PageKey[]).map((key) => {
                         const { page: PageComponent, unmountWhenHidden } = pageMapping[key]
                         const isActive = currentPage === key
@@ -100,6 +102,7 @@ function Shell() {
                         )
                     })}
                 </main>
+                <PerformanceDock />
             </SidebarInset>
             {!connected && <Disconnected />}
         </>
@@ -110,9 +113,11 @@ function Mainpage() {
     return (
         <SettingsProvider>
             <SystemStatusProvider>
+              <HardwareProvider>
                 <SidebarProvider defaultOpen={!document.cookie.includes("sidebar_state=false")}>
                     <Shell />
                 </SidebarProvider>
+              </HardwareProvider>
             </SystemStatusProvider>
         </SettingsProvider>
     );

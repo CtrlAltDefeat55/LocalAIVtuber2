@@ -4,6 +4,8 @@ import threading
 from typing import Optional
 
 from services.lib.LAV_logger import logger
+from services.lib.secrets import get_secret
+from . import remote as remote_api
 from .engines import ENGINES, EngineManager, detect_gpu
 from .voice_library import VoiceLibrary
 
@@ -36,14 +38,46 @@ class TTS:
         self.options: dict = {"speed": 1.0}
         self.gpu = detect_gpu()
         self._start_lock = threading.Lock()
+        # "local" = engines on this PC; otherwise a key of remote_api.PROVIDERS (Voicebox, OpenAI-compatible, ElevenLabs)
+        self.source = "local"
+        self.remote = {"base_url": "", "voice": "", "voice_name": "", "model": "", "language": "en"}
+        self.remote_error: Optional[str] = None
         voices = self.voices.list()
         if voices:
             self.current_voice = "leaf" if any(v["name"] == "leaf" for v in voices) else voices[0]["name"]
 
     # ------------------------------------------------------------------ selection
 
+    def remote_state(self) -> str:
+        if not (self.remote["base_url"] and self.remote["voice"]):
+            return "not_installed"
+        return "error" if self.remote_error else "ready"
+
+    def summary(self) -> dict:
+        """Compact state for the sidebar / Studio header."""
+        if self.source != "local":
+            label = remote_api.PROVIDERS[self.source]["label"]
+            return {"source": self.source, "active_engine": label, "current_voice": self.remote["voice_name"] or self.remote["voice"],
+                    "state": self.remote_state(), "error": self.remote_error}
+        return {"source": "local", "active_engine": self.active_engine, "current_voice": self.current_voice,
+                "state": self.engines.engine_state(self.active_engine), "error": self.engines.errors.get(self.active_engine)}
+
+    def set_source(self, source: str):
+        source = source if source in remote_api.PROVIDERS else "local"
+        if source == self.source:
+            return
+        self.source = source
+        self.remote_error = None
+        if source != "local":
+            self.engines.stop_all_except(None)  # free the GPU while a remote voice is used
+        elif self.engines.is_installed(self.active_engine):
+            self.start_in_background()
+
     def status(self) -> dict:
         return {
+            "source": self.source,
+            "remote": {**self.remote, "has_key": bool(get_secret(f"tts.{self.source}")) if self.source != "local" else False,
+                       "state": self.remote_state(), "error": self.remote_error},
             "active_engine": self.active_engine,
             "current_voice": self.current_voice,
             "engines": self.engines.list(),
@@ -81,11 +115,26 @@ class TTS:
 
     # ------------------------------------------------------------------ synthesis
 
-    async def synthesize(self, text: str, voice_name: Optional[str] = None, engine_id: Optional[str] = None) -> bytes:
-        engine_id = engine_id or self.active_engine
+    async def synthesize(self, text: str, voice_name: Optional[str] = None, engine_id: Optional[str] = None) -> tuple:
+        """Returns (audio bytes, media type)."""
         text = speakable(text)
         if not text:
             raise ValueError("Nothing to say (the text only contained actions, emoji or symbols).")
+        if self.source != "local" and not engine_id:
+            r = self.remote
+            if not r["base_url"]:
+                raise LookupError("The voice service isn't set up yet. Open the Voice page.")
+            try:
+                result = await remote_api.synthesize(self.source, r["base_url"], get_secret(f"tts.{self.source}"), text,
+                                                     r["voice"], r["model"], r["language"], self.options.get("speed", 1.0))
+                self.remote_error = None
+                return result
+            except LookupError:
+                raise
+            except Exception as e:
+                self.remote_error = remote_api.explain(e, r["base_url"])
+                raise RuntimeError(self.remote_error) from e
+        engine_id = engine_id or self.active_engine
         voice = self.voices.get(voice_name or self.current_voice or "")
         if not voice:
             raise LookupError("No voice selected. Add or choose a voice on the Voice page.")
@@ -96,7 +145,7 @@ class TTS:
             raise LookupError(f"{ENGINES[engine_id]['label']} is still installing.")
         if state != "ready":
             await asyncio.to_thread(self._start_blocking, engine_id)
-        return await self.engines.synthesize(engine_id, text, voice, self.options)
+        return await self.engines.synthesize(engine_id, text, voice, self.options), "audio/wav"
 
     def _start_blocking(self, engine_id: str):
         with self._start_lock:

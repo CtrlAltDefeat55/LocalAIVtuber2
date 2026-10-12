@@ -18,13 +18,16 @@ A fully local AI VTuber that talks in real time, can see your screen, and runs e
 ## Install and start (one download)
 
 1. Download **`LocalAIVtuber-vX.Y.Z.zip`** from the [Releases page](../../releases) and extract it anywhere. Avoid OneDrive or other synced folders: models are large.
-2. Start it:
-   - **Windows:** double-click **`start.bat`**
-   - **macOS (Apple Silicon):** double-click **`start.command`**. The first time, macOS may ask you to confirm: right-click, then **Open**.
-   - **Linux:** run **`./start.sh`**
+2. Start it with the script for your system:
+   - **Windows:** double-click **`Start Windows.bat`**
+   - **macOS (Apple Silicon):** double-click **`Start Mac.command`**. The first time, macOS may ask you to confirm: right-click, then **Open**.
+   - **Linux:** run **`./Start Linux.sh`**
+
+   After the first run, the scripts for the other systems are moved into **`Other start scripts/`**, so only yours stays in the folder.
 3. The first start sets everything up inside the folder. Nothing is installed system-wide.
    - It downloads a private Python and the app's packages (about 3 GB), plus the LLM runtime that matches your GPU.
-   - It asks which **brain** and **voice engine** to download. Press Enter to accept the recommendation for your hardware.
+   - It **checks your computer** (CPU, RAM, every graphics card, free disk) and recommends the brain and voice that will run well on it. If Windows blocks part of the check, it tells you what it couldn't read and recommends from what it found.
+   - It asks which **brain** and **voice engine** to download. Press Enter to accept the recommendation, or choose to connect an API instead.
    - It adds a **Local AI VTuber** shortcut with the app icon to your desktop (and the Start menu on Windows).
 4. The app opens in its own window. Closing that window (or clicking **Quit** in the app) stops the model, the voice and the server, and frees GPU memory.
 
@@ -32,9 +35,9 @@ After that, use the desktop shortcut. Later starts take seconds.
 
 | Command | What it does |
 |---|---|
-| `start.bat` / `start.command` / `start.sh` | Install anything missing, then start |
+| `Start Windows.bat` / `Start Mac.command` / `Start Linux.sh` | Install anything missing, then start |
 | `… --update` | Update the LLM runtime and Python packages |
-| `… --setup` | Choose the brain and voice engine to download again |
+| `… --setup` | Re-run the hardware check and choose the brain and voice again |
 | `… --no-window` | Run without opening a window (e.g. capture only in OBS from `http://127.0.0.1:8000`) |
 
 **Uninstall:** delete the folder (and the desktop shortcut).
@@ -54,6 +57,16 @@ Open the **Brain** page to download, switch or delete models. Download progress 
 - "Think before answering" is off by default: thinking adds a long pause before the VTuber speaks.
 - llama.cpp auto-fits layers and context to your VRAM. Use **GPU layers → Manual** only to leave room for other apps.
 
+### Use LM Studio, Ollama or an online API instead
+
+On the **Brain** page choose **Use an API**. Presets cover **LM Studio**, **Ollama**, llama.cpp/KoboldCpp, **OpenAI**, **OpenRouter**, **Groq** and **Google Gemini**; any OpenAI-compatible server works with **Other**. Then:
+
+1. Enter the address. For LM Studio on another PC, turn on *Serve on Local Network* in LM Studio and use that PC's address, e.g. `http://192.168.1.20:1234/v1`.
+2. Add an API key if the service needs one.
+3. Click **Test connection**, pick the model, and click **Use this API**.
+
+The local model is unloaded while an API is in use, so your GPU stays free for games. API keys are stored in Windows Credential Manager or the macOS Keychain, not in the app's files.
+
 ## Choosing a voice
 
 Open the **Voice** page and click **Install** on an engine. Each engine gets its own isolated environment, so they never conflict. Then select a voice from the library and type in the "Speak" box to hear it. It shows how long each line took, so you can compare engines.
@@ -69,6 +82,11 @@ Open the **Voice** page and click **Install** on an engine. Each engine gets its
 - **Add a voice:** drop a 6–15 second clean recording of one speaker and type exactly what is said. Every engine uses the same voice library. Chatterbox needs more than 5 seconds.
 - **TADA** uses Meta Llama 3.2. Accept the licenses on huggingface.co ([Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B), [tada-1b](https://huggingface.co/HumeAI/tada-1b)), then paste a free Hugging Face token in **Settings**.
 - Only one engine runs at a time, so switching frees the previous engine's GPU memory.
+- **Use a voice service instead:** choose **Voicebox** (on this or another PC; default port 17493), **OpenAI-compatible speech** (OpenAI, Kokoro-FastAPI, LocalAI, …) or **ElevenLabs** at the top of the Voice page, test the connection, and pick a voice.
+
+## Performance monitor
+
+The bar at the bottom of the app shows how much **CPU, RAM, GPU memory and GPU load** the brain, the voice, the character window and the rest of the app are using, next to everything else running on your PC. Click it for exact numbers per part and a short history. It helps you see whether a game or other program will have room. Where the operating system doesn't allow a reading (for example per-app GPU memory on some Windows drivers, or GPU details on macOS), the panel says so.
 
 ## Characters
 
@@ -103,7 +121,7 @@ No log files are written; recent output is kept in memory and visible in the app
 
 ## Troubleshooting
 
-- **"The LLM runtime is missing"**: run `start.bat --update`.
+- **"The LLM runtime is missing"**: run your start script with `--update` (e.g. `"Start Windows.bat" --update`).
 - **A download stopped**: start again; downloads resume where they left off.
 - **Replies are slow**: pick a smaller model (Gemma 4 12B), lower the memory window on the Brain page, or close other GPU-heavy apps.
 - **No sound**: click once anywhere in the app window (browsers block audio until you interact), and check the Voice page shows the engine as *Running*.
