@@ -106,7 +106,15 @@ On the **Character** page, choose **2D · Live2D** or **3D · VRM**, then:
 
 ## Where things are stored
 
-Everything is inside the app folder:
+Everything is inside the app folder: model weights, Python, temporary files and every library cache are redirected into it, so nothing is written to your user profile except the desktop / Start-menu shortcut. The app's servers only listen on this PC (`127.0.0.1`).
+
+**What goes online, and when:**
+
+- **First setup and downloads you start:** Python, packages and llama.cpp (GitHub, PyPI, PyTorch), and models / voices (Hugging Face).
+- **Only if you turn them on:** an online LLM or voice API, LM Studio / Voicebox on another PC, YouTube live chat.
+- Nothing else: no telemetry, no accounts. The UI loads no outside fonts or scripts, and the app window has the browser's sync and background calls switched off.
+
+API keys are the one thing kept outside the folder: they go to Windows Credential Manager / macOS Keychain (on this PC only) so they are not left in plain text in a folder you might zip up or share.
 
 ```
 runtime/   private Python, app environment, voice-engine environments, llama.cpp

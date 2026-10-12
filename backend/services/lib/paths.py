@@ -47,6 +47,14 @@ def configure_environment():
         "MODELSCOPE_CACHE": CACHE_DIR / "modelscope",
         "UV_CACHE_DIR": CACHE_DIR / "uv",
         "UV_PYTHON_INSTALL_DIR": RUNTIME_DIR / "python",
+        # Smaller caches libraries would otherwise drop in the user's home folder.
+        "XDG_CACHE_HOME": CACHE_DIR / "xdg",
+        "MPLCONFIGDIR": CACHE_DIR / "matplotlib",
+        "NUMBA_CACHE_DIR": CACHE_DIR / "numba",
+        "TRITON_CACHE_DIR": CACHE_DIR / "triton",
+        "TORCHINDUCTOR_CACHE_DIR": CACHE_DIR / "torchinductor",
+        "CUDA_CACHE_PATH": CACHE_DIR / "nv",
+        "EASYOCR_MODULE_PATH": CACHE_DIR / "easyocr",
     }
     for key, value in defaults.items():
         os.environ.setdefault(key, str(value))
@@ -60,6 +68,11 @@ def configure_environment():
     # Session scratch: anything left behind by a crash is reclaimed here.
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    # Temporary files (audio clips, uploads) stay inside the app folder too.
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[key] = str(TEMP_DIR)
+    import tempfile
+    tempfile.tempdir = None  # re-read the variables above
 
 
 def hf_token():

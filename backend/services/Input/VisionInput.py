@@ -7,6 +7,7 @@ import os
 import numpy as np
 from typing import List, Tuple, Dict, Optional
 from ..lib.LAV_logger import logger
+from ..lib.paths import CACHE_DIR
 import json
 import traceback
 
@@ -34,7 +35,8 @@ class VisionInput:
     def ocr_reader(self):
         if self._ocr_reader is None:
             try:
-                self._ocr_reader = easyocr.Reader(self.languages)
+                self._ocr_reader = easyocr.Reader(self.languages, model_storage_directory=str(CACHE_DIR / "easyocr" / "model"),
+                                                    user_network_directory=str(CACHE_DIR / "easyocr" / "user_network"))
                 self.logger.info(f"OCR reader initialized with languages: {self.languages}")
             except Exception as e:
                 self.logger.error(f"Failed to initialize OCR reader: {e}")

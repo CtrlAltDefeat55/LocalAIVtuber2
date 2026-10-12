@@ -598,7 +598,10 @@ def open_window():
         profile = CACHE / "app-window"
         return subprocess.Popen([str(browser), f"--app={URL}", f"--user-data-dir={profile}",
                                  "--window-size=1440,900", "--no-first-run", "--no-default-browser-check",
-                                 "--autoplay-policy=no-user-gesture-required"],
+                                 "--autoplay-policy=no-user-gesture-required",
+                                 # Keep the app window quiet: no sync, update or background calls home.
+                                 "--disable-background-networking", "--disable-sync", "--disable-component-update",
+                                 "--disable-features=Translate,MediaRouter,OptimizationHints", "--no-pings"],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     webbrowser.open(URL)
     return None
