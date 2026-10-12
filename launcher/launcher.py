@@ -540,16 +540,50 @@ def relocate_envs(state):
     save_state(state)
 
 
+FRONTEND = ROOT / "frontend"
+FRONTEND_INPUTS = ("index.html", "package-lock.json", "vite.config.ts", "tsconfig.json", "tsconfig.app.json")
+
+
+def frontend_source_hash() -> str:
+    """Fingerprint of the UI source; frontend/dist/.source-hash records what dist was built from.
+    Line endings are normalised so a Windows checkout (CRLF) matches."""
+    h = hashlib.sha256()
+    files = [FRONTEND / n for n in FRONTEND_INPUTS]
+    for folder in ("src", "public"):
+        files += [p for p in (FRONTEND / folder).rglob("*")]
+    for f in sorted((p for p in files if p.is_file()), key=lambda p: p.relative_to(FRONTEND).as_posix()):
+        h.update(f.relative_to(FRONTEND).as_posix().encode() + b"\0")
+        h.update(f.read_bytes().replace(b"\r\n", b"\n"))
+    return h.hexdigest()[:16]
+
+
 def setup_frontend():
-    if (ROOT / "frontend" / "dist" / "index.html").exists():
+    """The UI ships prebuilt (frontend/dist). It is only rebuilt when its source was changed
+    and Node.js is installed; otherwise the prebuilt copy is used as is."""
+    dist = FRONTEND / "dist"
+    have_dist = (dist / "index.html").exists()
+    stamp = dist / ".source-hash"
+    built_from = stamp.read_text(encoding="utf-8").strip() if stamp.exists() else None
+    current = frontend_source_hash() if (FRONTEND / "src").exists() else None
+    if have_dist and (not current or not built_from or built_from == current):
         return
-    step("Building the user interface (only needed for source checkouts)")
     npm = shutil.which("npm")
     if not npm:
+        if have_dist:
+            return  # UI source was edited but Node.js isn't installed: keep using the prebuilt UI
         fail("frontend/dist is missing and Node.js is not installed. Use the release zip, or install "
              "Node.js 20+ from nodejs.org and run the start script again.")
-    run([npm, "ci"], cwd=ROOT / "frontend", shell=IS_WIN)
-    run([npm, "run", "build"], cwd=ROOT / "frontend", shell=IS_WIN)
+    step("Building the user interface from its source (1-3 minutes; 'npm warn deprecated' lines are normal)")
+    install = ["ci"] if not (FRONTEND / "node_modules").exists() else ["install"]
+    ok = all(subprocess.run([npm, *cmd, "--no-audit", "--no-fund"] if cmd[0] != "run" else [npm, *cmd],
+                            cwd=str(FRONTEND), shell=IS_WIN).returncode == 0
+             for cmd in (install, ["run", "build"]))
+    if ok and (dist / "index.html").exists():
+        stamp.write_text(current or "", encoding="utf-8")
+    elif have_dist or (dist / "index.html").exists():
+        say("    [!] Building the UI failed; using the existing prebuilt UI instead.")
+    else:
+        fail("Building the user interface failed (see above). Use the release zip, which includes it.")
 
 
 def backend_tool(*args):
